@@ -1,0 +1,20 @@
+{
+  "name": "super-memory",
+  "version": "0.1.0",
+  "description": "An adaptive AI browser agent that remembers verified workflows, checks website changes, and recovers when saved workflows become outdated.",
+  "type": "module",
+  "main": "dist/index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "test:baseten": "node --env-file=.env scripts/test-baseten.js"
+  },
+  "keywords": [
+    "ai",
+    "agent",
+    "browser-agent",
+    "workflow-memory",
+    "super-memory"
+  ],
+  "author": "",
+  "license": "MIT"
+}
