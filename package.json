@@ -5,7 +5,9 @@
   "type": "module",
   "main": "dist/index.js",
   "scripts": {
-    "test": "node --test tests/**/*.test.js",
+    "test": "node --test \"tests/**/*.test.js\"",
+    "test:models": "node --test \"tests/models/**/*.test.js\"",
+    "test:browser": "node --test \"tests/browser/**/*.test.js\"",
     "test:baseten": "node --env-file=.env scripts/test-baseten.js",
     "test:meta": "node --env-file=.env scripts/test-meta.js"
   },
@@ -17,5 +19,8 @@
     "super-memory"
   ],
   "author": "",
-  "license": "MIT"
+  "license": "MIT",
+  "dependencies": {
+    "playwright": "^1.64.1"
+  }
 }
