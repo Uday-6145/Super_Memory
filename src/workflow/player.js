@@ -21,6 +21,18 @@
 
 import { randomUUID } from 'node:crypto';
 import { performance } from 'node:perf_hooks';
+import { createRequire } from 'node:module';
+
+const require = createRequire(import.meta.url);
+let installedPlaywrightVersion;
+try {
+  const pkg = require('playwright/package.json');
+  if (typeof pkg?.version === 'string' && pkg.version.trim() !== '') {
+    installedPlaywrightVersion = pkg.version.trim();
+  }
+} catch {
+  installedPlaywrightVersion = undefined;
+}
 
 import {
   WorkflowError,
@@ -34,6 +46,7 @@ import {
 
 import { validateWorkflowId, verifyEvidenceMatchesWorkflow } from './schema.js';
 import { calculateContentHash } from './hash.js';
+import { collectFailureDiagnostic } from './diagnostics.js';
 import { createBrowserRuntime, ActionError } from '../browser/index.js';
 
 /**
@@ -751,6 +764,128 @@ export class WorkflowPlayer {
       );
     }
 
+    return await this._executeWorkflowVersion(versionObj, inputs, options);
+  }
+
+  /**
+   * Executes a trial run of the current unapproved draft version for verification purposes.
+   * Does NOT alter manifest.activeVersion, enable the workflow, or promote the draft.
+   * Generates genuine verification evidence reflecting actual execution results.
+   *
+   * @param {string} workflowId - Identifier of workflow whose draft to test.
+   * @param {Record<string, string>} [inputs={}] - Test inputs for trial run.
+   * @param {object} [options]
+   * @param {number} [options.stepTimeoutMs]
+   * @returns {Promise<{ runResult: object, evidence: object, candidatePromotionReady: boolean }>}
+   */
+  async playDraftForVerification(workflowId, inputs = {}, options = {}) {
+    if (this._isClosed) {
+      throw new WorkflowError('Cannot play draft: WorkflowPlayer is closed.');
+    }
+
+    validateWorkflowId(workflowId);
+
+    const manifest = await this.repository.getManifest(workflowId);
+    if (!manifest) {
+      throw new WorkflowNotFoundError(`Workflow "${workflowId}" not found.`, { workflowId });
+    }
+
+    if (manifest.draftVersion === null || manifest.draftVersion === undefined) {
+      throw new WorkflowError(`Workflow "${workflowId}" has no draft version for verification.`, { workflowId });
+    }
+
+    const draftVersionObj = await this.repository.getVersion(workflowId, manifest.draftVersion);
+    if (!draftVersionObj) {
+      throw new WorkflowNotFoundError(
+        `Draft version ${manifest.draftVersion} for workflow "${workflowId}" not found on disk.`,
+        { workflowId, version: manifest.draftVersion }
+      );
+    }
+
+    if (draftVersionObj.status !== 'draft') {
+      throw new WorkflowError(
+        `Target version ${manifest.draftVersion} of workflow "${workflowId}" is not in draft status (status: "${draftVersionObj.status}").`,
+        { workflowId, version: manifest.draftVersion }
+      );
+    }
+
+    const contentHash = calculateContentHash(draftVersionObj);
+    const runResult = await this._executeWorkflowVersion(draftVersionObj, inputs, { ...options, throwOnFailure: false });
+
+    const stepResults = runResult.stepResults.map((sr) => ({
+      stepId: sr.stepId,
+      action: sr.action,
+      ok: Boolean(sr.ok),
+      status: sr.status ?? null,
+      durationMs: typeof sr.durationMs === 'number' ? sr.durationMs : 0,
+      verification: sr.verification
+        ? {
+            type: sr.verification.type,
+            passed: Boolean(sr.verification.passed),
+          }
+        : null,
+    }));
+
+    const successCriteriaResult = runResult.successCriteriaResult
+      ? {
+          passed: Boolean(runResult.successCriteriaResult.passed),
+          finalPath: runResult.successCriteriaResult.finalPathMatched ?? null,
+          pageTitleMatched: runResult.successCriteriaResult.pageTitleMatched ?? null,
+          textPresentFound: runResult.successCriteriaResult.textPresentFound ?? null,
+          textAbsentFound: runResult.successCriteriaResult.textAbsentFound ?? null,
+          details:
+            runResult.successCriteriaResult.details ??
+            (runResult.successCriteriaResult.passed ? 'Success criteria passed.' : 'Success criteria failed.'),
+        }
+      : {
+          passed: false,
+          finalPath: null,
+          pageTitleMatched: null,
+          textPresentFound: null,
+          textAbsentFound: null,
+          details: runResult.error || 'Execution aborted before success criteria evaluation.',
+        };
+
+    const evidence = {
+      $schema: 'https://supermemory.ai/schemas/workflow-evidence-1.0.0.json',
+      schemaVersion: '1.0.0',
+      workflowId,
+      version: draftVersionObj.version,
+      contentHash,
+      runId: runResult.runId,
+      verifiedAt: runResult.finishedAt || new Date().toISOString(),
+      environment: {
+        targetOrigin: draftVersionObj.target.origin,
+        browserEngine: 'chromium',
+        ...(installedPlaywrightVersion ? { playwrightVersion: installedPlaywrightVersion } : {}),
+        nodeVersion: process.version,
+        platform: process.platform,
+      },
+      stepResults,
+      successCriteriaResult,
+    };
+
+    const candidatePromotionReady = runResult.ok && successCriteriaResult.passed;
+
+    return {
+      runResult,
+      evidence,
+      candidatePromotionReady,
+    };
+  }
+
+  /**
+   * Internal execution core shared by verified playback and draft trial verification.
+   *
+   * @private
+   * @param {object} versionObj - Validated workflow version object.
+   * @param {Record<string, string>} inputs
+   * @param {object} options
+   * @returns {Promise<object>}
+   */
+  async _executeWorkflowVersion(versionObj, inputs = {}, options = {}) {
+    const workflowId = versionObj.workflowId;
+
     // 2. Validate all runtime inputs before browser initialization
     validateRuntimeInputs(versionObj.inputs, inputs, workflowId);
     const inputSecrets = Object.values(inputs).filter((value) => typeof value === 'string');
@@ -772,11 +907,13 @@ export class WorkflowPlayer {
       stepResults: [],
       successCriteriaResult: null,
       error: null,
+      diagnostic: null,
       subresourceReport: null,
     };
 
     const runtime = await this._getRuntime();
     let session = null;
+    let lastFailedStep = null;
     let crossOriginBlockedUrl = null;
     let routeFault = null;
     const committedMainFrameUrls = [];
@@ -1079,6 +1216,7 @@ export class WorkflowPlayer {
           stepResult.durationMs = Math.round(performance.now() - stepStart);
           runResult.stepResults.push(stepResult);
         } catch (stepErr) {
+          lastFailedStep = step;
           stepResult.ok = false;
           stepResult.durationMs = Math.round(performance.now() - stepStart);
           const rawErr = confinementFailureMessage() ?? stepErr.message;
@@ -1132,6 +1270,24 @@ export class WorkflowPlayer {
         runResult.error = sanitizeErrorMessage(rawErr, inputSecrets);
       }
     } finally {
+      if (!runResult.ok && !runResult.diagnostic) {
+        try {
+          runResult.diagnostic = await collectFailureDiagnostic({
+            workflowId,
+            version: versionObj.version,
+            error: runResult.error,
+            failedStep: lastFailedStep,
+            session,
+            secrets: inputSecrets,
+            confinementViolation: Boolean(crossOriginBlockedUrl),
+            successCriteriaResult: runResult.successCriteriaResult,
+            verification: lastFailedStep?.verification || null,
+          });
+        } catch {
+          // Failure diagnostics must never break playback execution or reporting.
+        }
+      }
+
       if (session) {
         await session.close().catch(() => {});
       }
@@ -1160,6 +1316,16 @@ export class WorkflowPlayer {
           runResult.ok = false;
           runResult.status = 'failed';
           runResult.error = sanitizeErrorMessage(flipMessage, inputSecrets);
+          runResult.diagnostic = {
+            workflowId,
+            version: versionObj.version,
+            category: 'CONFINEMENT_VIOLATION',
+            error: runResult.error,
+            failedStep: null,
+            page: { url: '', title: '', snapshot: null },
+            successCriteriaMismatch: null,
+            timestamp: new Date().toISOString(),
+          };
         }
       }
       runResult.subresourceReport = {

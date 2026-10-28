@@ -11,6 +11,7 @@ import {
   BasetenProvider,
   MetaProvider,
   createModelProvider,
+  getPreferredRecoveryProvider,
   ProviderError,
   MissingApiKeyError,
   ApiError,
@@ -346,7 +347,7 @@ describe('Model Provider Abstraction (Offline Test Suite)', () => {
     assert.equal(result.text, 'Success');
   });
 
-  // 9. Both providers conform to the same public contract
+  // 9. All providers conform to the identical public contract
   it('9. ensures both Baseten and Meta conform to the identical public contract', async () => {
     const baseten = createModelProvider('baseten', {
       apiKey: 'dummy',
@@ -370,17 +371,47 @@ describe('Model Provider Abstraction (Offline Test Suite)', () => {
         }),
     });
 
+    const modal = createModelProvider('modal', {
+      apiKey: 'dummy',
+      fetch: async () =>
+        createMockResponse({
+          json: {
+            model: 'meta-llama/llama-3.1-70b-instruct',
+            choices: [{ finish_reason: 'stop', message: { content: 'C' } }],
+          },
+        }),
+    });
+
+    const fireworks = createModelProvider('fireworks', {
+      apiKey: 'dummy',
+      fetch: async () =>
+        createMockResponse({
+          json: {
+            model: 'accounts/fireworks/models/llama-v3p1-70b-instruct',
+            choices: [{ finish_reason: 'stop', message: { content: 'D' } }],
+          },
+        }),
+    });
+
     assert.equal(typeof baseten.complete, 'function');
     assert.equal(typeof meta.complete, 'function');
+    assert.equal(typeof modal.complete, 'function');
+    assert.equal(typeof fireworks.complete, 'function');
     assert.equal(baseten.provider, 'baseten');
     assert.equal(meta.provider, 'meta');
+    assert.equal(modal.provider, 'modal');
+    assert.equal(fireworks.provider, 'fireworks');
 
     const basetenRes = await baseten.complete({ messages: [{ role: 'user', content: 'Hi' }] });
     const metaRes = await meta.complete({ messages: [{ role: 'user', content: 'Hi' }] });
+    const modalRes = await modal.complete({ messages: [{ role: 'user', content: 'Hi' }] });
+    const fireworksRes = await fireworks.complete({ messages: [{ role: 'user', content: 'Hi' }] });
 
     const expectedKeys = ['text', 'provider', 'model', 'finishReason', 'isTruncated', 'usage'].sort();
     assert.deepEqual(Object.keys(basetenRes).sort(), expectedKeys);
     assert.deepEqual(Object.keys(metaRes).sort(), expectedKeys);
+    assert.deepEqual(Object.keys(modalRes).sort(), expectedKeys);
+    assert.deepEqual(Object.keys(fireworksRes).sort(), expectedKeys);
   });
 
   // 10. Truncated responses are identified without being mistaken for complete output
@@ -453,5 +484,175 @@ describe('Model Provider Abstraction (Offline Test Suite)', () => {
     assert.equal(extractTextContent(null), '');
     assert.equal(extractTextContent(undefined), '');
     assert.equal(extractTextContent({}), '');
+  });
+
+  // Retries and Meta resolution
+  it('BaseModelProvider retries on transient errors and succeeds', async () => {
+    let callCount = 0;
+    const provider = new BasetenProvider({
+      apiKey: 'test-key',
+      fetch: async () => {
+        callCount++;
+        if (callCount === 1) {
+          return createMockResponse({
+            ok: false,
+            status: 503,
+            statusText: 'Service Unavailable',
+            text: 'Busy',
+          });
+        }
+        return createMockResponse({
+          json: {
+            model: 'meta-models/muse-spark-open-1026',
+            choices: [{ message: { role: 'assistant', content: 'Recovered!' } }],
+          },
+        });
+      },
+    });
+
+    const res = await provider.complete({
+      messages: [{ role: 'user', content: 'test' }],
+      retries: 2,
+      retryDelayMs: 10,
+    });
+
+    assert.equal(callCount, 2);
+    assert.equal(res.text, 'Recovered!');
+  });
+
+  it('BaseModelProvider does not retry non-transient 401 client error', async () => {
+    let callCount = 0;
+    const provider = new BasetenProvider({
+      apiKey: 'test-key',
+      fetch: async () => {
+        callCount++;
+        return createMockResponse({
+          ok: false,
+          status: 401,
+          statusText: 'Unauthorized',
+          text: 'Invalid API Key',
+        });
+      },
+    });
+
+    await assert.rejects(
+      () =>
+        provider.complete({
+          messages: [{ role: 'user', content: 'test' }],
+          retries: 2,
+          retryDelayMs: 10,
+        }),
+      (err) => {
+        assert.equal(err.statusCode, 401);
+        assert.equal(callCount, 1);
+        return true;
+      }
+    );
+  });
+
+  it('getPreferredRecoveryProvider prioritizes Meta API, falls back to Baseten, and throws if none available', () => {
+    // 1. Meta direct route
+    const metaRoute = getPreferredRecoveryProvider({ apiKey: 'meta-direct-key' });
+    assert.equal(metaRoute.provider, 'meta');
+
+    // 2. Baseten route when no Meta key is present
+    const origMetaEnv = process.env.META_API_KEY;
+    const origModelEnv = process.env.MODEL_API_KEY;
+    const origBasetenEnv = process.env.BASETEN_API_KEY;
+
+    try {
+      delete process.env.META_API_KEY;
+      delete process.env.MODEL_API_KEY;
+      process.env.BASETEN_API_KEY = 'baseten-test-key';
+
+      const basetenRoute = getPreferredRecoveryProvider();
+      assert.equal(basetenRoute.provider, 'baseten');
+      assert.equal(basetenRoute.modelId, 'meta-models/muse-spark-open-1026');
+
+      // 3. Fails cleanly when neither key is present
+      delete process.env.BASETEN_API_KEY;
+      assert.throws(
+        () => getPreferredRecoveryProvider(),
+        (err) => {
+          assert.equal(err.code, 'NO_RECOVERY_PROVIDER');
+          assert(err.message.includes('No Meta reasoning route available'));
+          return true;
+        }
+      );
+    } finally {
+      if (origMetaEnv !== undefined) process.env.META_API_KEY = origMetaEnv;
+      if (origModelEnv !== undefined) process.env.MODEL_API_KEY = origModelEnv;
+      if (origBasetenEnv !== undefined) process.env.BASETEN_API_KEY = origBasetenEnv;
+    }
+  });
+
+  // Hardened error handling & sanitization
+  it('bounds oversized provider error responses to 500 characters and strips control characters', async () => {
+    const hugeMessage = 'Error detail: ' + 'A'.repeat(1000) + '\x00\x1b[31mControlChar\x07';
+    const provider = new BasetenProvider({
+      apiKey: 'test-key',
+      fetch: async () =>
+        createMockResponse({
+          ok: false,
+          status: 500,
+          statusText: 'Internal Error',
+          json: { error: { message: hugeMessage } },
+        }),
+    });
+
+    await assert.rejects(
+      () => provider.complete({ messages: [{ role: 'user', content: 'test' }] }),
+      (err) => {
+        assert(err instanceof ApiError);
+        assert(err.responseBody.length <= 500);
+        assert(!err.responseBody.includes('\x00'));
+        assert(!err.responseBody.includes('\x07'));
+        return true;
+      }
+    );
+  });
+
+  it('masks API keys if echoed in provider error response body', async () => {
+    const rawSecret = 'SUPER_SECRET_KEY_12345';
+    const provider = new BasetenProvider({
+      apiKey: rawSecret,
+      fetch: async () =>
+        createMockResponse({
+          ok: false,
+          status: 403,
+          statusText: 'Forbidden',
+          text: `Invalid credential ${rawSecret} supplied.`,
+        }),
+    });
+
+    await assert.rejects(
+      () => provider.complete({ messages: [{ role: 'user', content: 'test' }] }),
+      (err) => {
+        assert(err instanceof ApiError);
+        assert(!err.message.includes(rawSecret));
+        assert(!err.responseBody.includes(rawSecret));
+        assert(err.responseBody.includes('[REDACTED]'));
+        return true;
+      }
+    );
+  });
+
+  it('sanitizes provider and model identifiers returned in completion', async () => {
+    const provider = new BasetenProvider({
+      apiKey: 'test-key',
+      fetch: async () =>
+        createMockResponse({
+          json: {
+            model: 'meta-models/muse-spark-open-1026;\x1b[31minjection\x00',
+            choices: [{ message: { role: 'assistant', content: 'hello' } }],
+          },
+        }),
+    });
+
+    const res = await provider.complete({ messages: [{ role: 'user', content: 'test' }] });
+    assert(!res.model.includes('\x1b'));
+    assert(!res.model.includes('\x00'));
+    assert(!res.model.includes(';'));
+    assert.equal(res.model, 'meta-models/muse-spark-open-102631minjection');
   });
 });
