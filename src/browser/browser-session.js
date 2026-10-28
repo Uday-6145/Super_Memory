@@ -19,13 +19,46 @@
 import { NavigationError, ActionError, TimeoutError } from './errors.js';
 
 /**
- * Checks whether a given hostname is an obvious loopback or localhost address.
+ * Checks whether a given hostname is an obvious loopback or localhost address,
+ * normalizing trailing FQDN dots and IPv4-mapped IPv6 representations.
  *
  * @param {string} hostname
  * @returns {boolean}
  */
 export function isLoopbackHostname(hostname) {
-  const normalized = hostname.toLowerCase().replace(/^\[|\]$/g, '');
+  if (!hostname || typeof hostname !== 'string') {
+    return false;
+  }
+
+  // Strip enclosing IPv6 brackets and trailing FQDN dots
+  let normalized = hostname.toLowerCase().trim().replace(/^\[|\]$/g, '').replace(/\.+$/, '');
+
+  // Normalize IPv4-mapped IPv6 representations (both dotted-decimal and canonical hex)
+  // to their standard IPv4 dotted-decimal equivalent.
+  // Matches e.g. ::ffff:127.0.0.1, 0:0:0:0:0:ffff:127.0.0.1, ::ffff:7f00:1
+  const ipv4MappedMatch = normalized.match(/^(?:(?:::)|(?:0{1,4}:)+)ffff:(.+)$/);
+  if (ipv4MappedMatch) {
+    const rest = ipv4MappedMatch[1];
+    const dotMatch = rest.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
+    if (dotMatch) {
+      const parts = [dotMatch[1], dotMatch[2], dotMatch[3], dotMatch[4]].map(Number);
+      if (parts.every((p) => p >= 0 && p <= 255)) {
+        normalized = parts.join('.');
+      }
+    } else {
+      const hexMatch = rest.match(/^([0-9a-f]{1,4}):([0-9a-f]{1,4})$/);
+      if (hexMatch) {
+        const high = parseInt(hexMatch[1], 16);
+        const low = parseInt(hexMatch[2], 16);
+        const b0 = (high >> 8) & 0xff;
+        const b1 = high & 0xff;
+        const b2 = (low >> 8) & 0xff;
+        const b3 = low & 0xff;
+        normalized = `${b0}.${b1}.${b2}.${b3}`;
+      }
+    }
+  }
+
   if (
     normalized === 'localhost' ||
     normalized.endsWith('.localhost') ||

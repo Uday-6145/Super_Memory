@@ -32,6 +32,10 @@ import {
   sanitizeErrorMessage,
   evaluateRefreshHeader,
   findAuditViolation,
+  recordAuditCommit,
+  COMMIT_AUDIT_HISTORY_LIMIT,
+  isPermittedBlankUrl,
+  isAuditViolation,
   WorkflowValidationError,
   WorkflowNotFoundError,
   WorkflowDisabledError,
@@ -1705,6 +1709,126 @@ describe('Workflow Player (Local Fixtures)', () => {
       assert.equal(findAuditViolation(['::::'], origin), '::::');
       assert.equal(findAuditViolation([null], origin), '(unavailable)');
       assert.equal(findAuditViolation(null, origin), null);
+    });
+
+    it('47b. permits about:blank and fragment-only variants while rejecting query and arbitrary about: variants (Fix 2)', async () => {
+      const origin = 'http://127.0.0.1:8080';
+
+      // Unit test: isPermittedBlankUrl
+      assert.equal(isPermittedBlankUrl('about:blank'), true);
+      assert.equal(isPermittedBlankUrl('about:blank#'), true);
+      assert.equal(isPermittedBlankUrl('about:blank#fragment'), true);
+      assert.equal(isPermittedBlankUrl('about:blank#foo=bar'), true);
+      assert.equal(isPermittedBlankUrl('ABOUT:BLANK'), true);
+      assert.equal(isPermittedBlankUrl('ABOUT:BLANK#frag'), true);
+
+      assert.equal(isPermittedBlankUrl('about:blank?query=1'), false);
+      assert.equal(isPermittedBlankUrl('about:blank?foo#bar'), false);
+      assert.equal(isPermittedBlankUrl('about:config'), false);
+      assert.equal(isPermittedBlankUrl('about:srcdoc'), false);
+      assert.equal(isPermittedBlankUrl('about:blank2'), false);
+      assert.equal(isPermittedBlankUrl('about:blank/sub'), false);
+      assert.equal(isPermittedBlankUrl('http://example.com/about:blank'), false);
+      assert.equal(isPermittedBlankUrl(null), false);
+
+      // findAuditViolation behavior
+      assert.equal(findAuditViolation(['about:blank#fragment'], origin), null);
+      assert.equal(findAuditViolation(['about:blank', 'about:blank#tab-1', 'http://127.0.0.1:8080/a'], origin), null);
+      assert.equal(findAuditViolation(['about:blank?query=1'], origin), 'about:blank?query=1');
+      assert.equal(findAuditViolation(['about:config'], origin), 'about:config');
+      assert.equal(findAuditViolation(['about:srcdoc'], origin), 'about:srcdoc');
+      assert.equal(findAuditViolation(['about:blank/sub'], origin), 'about:blank/sub');
+
+      // End-to-end player playback with permitted about:blank#fragment
+      const { state: permittedState, runtime: permittedRuntime } = makeAuditedSessionDouble(baseUrl);
+      permittedState.extraCommits = ['about:blank#ready'];
+      await createOneStepAuditWorkflow('wf_audit_blank_frag', '/checkout');
+      const permittedPlayer = new WorkflowPlayer({ repository: repo, browserRuntime: permittedRuntime, allowLocalhost: true });
+      const permittedResult = await permittedPlayer.play('wf_audit_blank_frag', { coupon: 'TEST' });
+      assert.equal(permittedResult.ok, true);
+      assert.equal(permittedResult.status, 'success');
+      await permittedPlayer.close();
+
+      // End-to-end player playback with disallowed about:config
+      const { state: disallowedState, runtime: disallowedRuntime } = makeAuditedSessionDouble(baseUrl);
+      disallowedState.extraCommits = ['about:config'];
+      await createOneStepAuditWorkflow('wf_audit_about_disallowed', '/checkout');
+      const disallowedPlayer = new WorkflowPlayer({ repository: repo, browserRuntime: disallowedRuntime, allowLocalhost: true });
+      const disallowedResult = await disallowedPlayer.play('wf_audit_about_disallowed', { coupon: 'TEST' });
+      assert.equal(disallowedResult.ok, false);
+      assert.equal(disallowedResult.status, 'failed');
+      assert.ok(disallowedResult.error.includes('Post-execution audit'));
+      await disallowedPlayer.close();
+    });
+
+    it('47c. bounds audit history to limit and deduplicates consecutive entries without suppressing distinct events (Fix 1)', () => {
+      // 1. Enforces size limit and records truncation indicators
+      const sink = [];
+      for (let i = 0; i < 1050; i++) {
+        recordAuditCommit(sink, `http://127.0.0.1:8080/page#frag${i}`, 'http://127.0.0.1:8080');
+      }
+      assert.equal(sink.length, COMMIT_AUDIT_HISTORY_LIMIT);
+      assert.equal(sink.isTruncated, true);
+      assert.equal(sink.truncated, true);
+      assert.equal(sink.omittedCount, 50);
+      assert.equal(sink.omittedEntries, 50);
+      assert.equal(sink[sink.length - 1], 'http://127.0.0.1:8080/page#frag1049');
+      assert.equal(sink.includes('http://127.0.0.1:8080/page#frag0'), false);
+
+      // 2. Deduplicates consecutive duplicates without suppressing distinct entries sharing an origin
+      const dupSink = [];
+      recordAuditCommit(dupSink, 'http://127.0.0.1:8080/a');
+      recordAuditCommit(dupSink, 'http://127.0.0.1:8080/a'); // consecutive duplicate
+      recordAuditCommit(dupSink, 'http://127.0.0.1:8080/a'); // consecutive duplicate
+      recordAuditCommit(dupSink, 'http://127.0.0.1:8080/b'); // distinct entry
+      recordAuditCommit(dupSink, 'http://127.0.0.1:8080/b'); // consecutive duplicate
+      recordAuditCommit(dupSink, 'http://127.0.0.1:8080/a'); // distinct navigation sharing origin
+      assert.deepEqual(dupSink, [
+        'http://127.0.0.1:8080/a',
+        'http://127.0.0.1:8080/b',
+        'http://127.0.0.1:8080/a',
+      ]);
+    });
+
+    it('47d. preserves detected security violations when history limit is reached without erasing unsafe findings (Fix 1)', async () => {
+      // 1. Benign eviction preserves earlier security violation
+      const sink = [];
+      recordAuditCommit(sink, 'http://127.0.0.1:8080/init', 'http://127.0.0.1:8080');
+      recordAuditCommit(sink, 'http://127.0.0.2:9/evil', 'http://127.0.0.1:8080');
+      for (let i = 0; i < 1100; i++) {
+        recordAuditCommit(sink, `http://127.0.0.1:8080/page#frag${i}`, 'http://127.0.0.1:8080');
+      }
+      assert.equal(sink.length, COMMIT_AUDIT_HISTORY_LIMIT);
+      assert.equal(sink.isTruncated, true);
+      assert.equal(sink.includes('http://127.0.0.2:9/evil'), true);
+      assert.equal(findAuditViolation(sink, 'http://127.0.0.1:8080'), 'http://127.0.0.2:9/evil');
+
+      // 2. All-violations flood: earliest violation is preserved in retainedViolation
+      const evilSink = [];
+      for (let i = 0; i < 1050; i++) {
+        recordAuditCommit(evilSink, `http://127.0.0.2:9/evil_${i}`, 'http://127.0.0.1:8080');
+      }
+      assert.equal(evilSink.length, COMMIT_AUDIT_HISTORY_LIMIT);
+      assert.equal(evilSink.isTruncated, true);
+      assert.equal(evilSink.retainedViolation, 'http://127.0.0.2:9/evil_0');
+      assert.equal(findAuditViolation(evilSink, 'http://127.0.0.1:8080'), 'http://127.0.0.2:9/evil_0');
+
+      // 3. End-to-end player execution with foreign commit followed by rapid fragment changes
+      const { state, runtime } = makeAuditedSessionDouble(baseUrl);
+      const extraCommits = ['http://127.0.0.2:9/evil'];
+      for (let i = 0; i < 1050; i++) {
+        extraCommits.push(`${baseUrl}/frag#${i}`);
+      }
+      state.extraCommits = extraCommits;
+      await createOneStepAuditWorkflow('wf_audit_overflow_evil', '/checkout');
+      const player = new WorkflowPlayer({ repository: repo, browserRuntime: runtime, allowLocalhost: true });
+      const result = await player.play('wf_audit_overflow_evil', { coupon: 'TEST' });
+
+      assert.equal(result.ok, false);
+      assert.equal(result.status, 'failed');
+      assert.ok(result.error.includes('Post-execution audit'));
+      assert.ok(result.error.includes('http://127.0.0.2:9/evil'));
+      await player.close();
     });
   });
 

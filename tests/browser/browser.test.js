@@ -12,6 +12,7 @@ import http from 'node:http';
 import {
   createBrowserRuntime,
   sanitizeSnapshotUrl,
+  isLoopbackHostname,
   NavigationError,
   ActionError,
   TimeoutError,
@@ -161,6 +162,23 @@ describe('Browser Runtime Integration Tests (Local Fixtures)', () => {
     try {
       await assert.rejects(
         () => restrictedSession.navigate(`${baseUrl}/`),
+        (err) => err instanceof NavigationError && err.message.includes('blocked by default')
+      );
+
+      // Regression: trailing dot bypass (localhost.) is blocked by default
+      const port = new URL(baseUrl).port;
+      await assert.rejects(
+        () => restrictedSession.navigate(`http://localhost.:${port}/`),
+        (err) => err instanceof NavigationError && err.message.includes('blocked by default')
+      );
+
+      // Regression: IPv4-mapped IPv6 loopback bypasses are blocked by default
+      await assert.rejects(
+        () => restrictedSession.navigate(`http://[::ffff:127.0.0.1]:${port}/`),
+        (err) => err instanceof NavigationError && err.message.includes('blocked by default')
+      );
+      await assert.rejects(
+        () => restrictedSession.navigate(`http://[::ffff:7f00:1]:${port}/`),
         (err) => err instanceof NavigationError && err.message.includes('blocked by default')
       );
     } finally {
@@ -426,5 +444,51 @@ describe('Browser Runtime Integration Tests (Local Fixtures)', () => {
     assert.equal(sanitizeSnapshotUrl('about:blank'), 'about:blank');
     assert.equal(sanitizeSnapshotUrl('about:blank?query=1#frag'), 'about:blank');
     assert.equal(sanitizeSnapshotUrl(''), '');
+  });
+
+  // 15. isLoopbackHostname normalizes trailing dots and IPv4-mapped IPv6 loopbacks correctly
+  it('15. isLoopbackHostname normalizes trailing dots and IPv4-mapped IPv6 loopbacks correctly', () => {
+    // Trailing dot normalization
+    assert.equal(isLoopbackHostname('localhost'), true);
+    assert.equal(isLoopbackHostname('localhost.'), true);
+    assert.equal(isLoopbackHostname('sub.localhost'), true);
+    assert.equal(isLoopbackHostname('sub.localhost.'), true);
+    assert.equal(isLoopbackHostname('127.0.0.1'), true);
+    assert.equal(isLoopbackHostname('127.0.0.1.'), true);
+    assert.equal(isLoopbackHostname('127.0.0.2'), true);
+    assert.equal(isLoopbackHostname('0.0.0.0'), true);
+    assert.equal(isLoopbackHostname('::1'), true);
+    assert.equal(isLoopbackHostname('[::1]'), true);
+    assert.equal(isLoopbackHostname('::'), true);
+    assert.equal(isLoopbackHostname('[::]'), true);
+
+    // IPv4-mapped IPv6 loopback normalization (both dotted-decimal and canonical hex)
+    assert.equal(isLoopbackHostname('[::ffff:127.0.0.1]'), true);
+    assert.equal(isLoopbackHostname('::ffff:127.0.0.1'), true);
+    assert.equal(isLoopbackHostname('[::ffff:7f00:1]'), true);
+    assert.equal(isLoopbackHostname('::ffff:7f00:1'), true);
+    assert.equal(isLoopbackHostname('[::ffff:127.0.0.2]'), true);
+    assert.equal(isLoopbackHostname('[::ffff:7f00:2]'), true);
+    assert.equal(isLoopbackHostname('[::ffff:0.0.0.0]'), true);
+    assert.equal(isLoopbackHostname('[::ffff:0:0]'), true);
+    assert.equal(isLoopbackHostname('[0:0:0:0:0:ffff:127.0.0.1]'), true);
+    assert.equal(isLoopbackHostname('0:0:0:0:0:ffff:127.0.0.1'), true);
+    assert.equal(isLoopbackHostname('[0000:0000:0000:0000:0000:ffff:7f00:1]'), true);
+
+    // Legitimate public hosts and non-loopback addresses must not be classified as loopback
+    assert.equal(isLoopbackHostname('example.com'), false);
+    assert.equal(isLoopbackHostname('example.com.'), false);
+    assert.equal(isLoopbackHostname('localhost.example.com'), false);
+    assert.equal(isLoopbackHostname('localhost.example.com.'), false);
+    assert.equal(isLoopbackHostname('notlocalhost'), false);
+    assert.equal(isLoopbackHostname('192.168.1.1'), false);
+    assert.equal(isLoopbackHostname('[::ffff:192.168.1.1]'), false);
+    assert.equal(isLoopbackHostname('[::ffff:c0a8:101]'), false);
+    assert.equal(isLoopbackHostname('8.8.8.8'), false);
+    assert.equal(isLoopbackHostname('[::ffff:8.8.8.8]'), false);
+    assert.equal(isLoopbackHostname('[::ffff:808:808]'), false);
+    assert.equal(isLoopbackHostname(''), false);
+    assert.equal(isLoopbackHostname(null), false);
+    assert.equal(isLoopbackHostname(undefined), false);
   });
 });

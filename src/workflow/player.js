@@ -177,13 +177,63 @@ export function evaluateRefreshHeader(rawValue, baseUrl, targetOrigin) {
 }
 
 /**
+ * Bounded history limit for the main-frame navigation commit audit.
+ * Caps the number of recorded navigation events to prevent unbounded memory growth
+ * from rapid fragment updates, client-side reloads, or SPA navigation loops.
+ */
+export const COMMIT_AUDIT_HISTORY_LIMIT = 1000;
+
+/**
+ * Checks whether a URL is a permitted blank URL (the base 'about:blank' form or a
+ * fragment-only variant such as 'about:blank#fragment').
+ * Arbitrary about: URLs (e.g. 'about:config', 'about:srcdoc', 'about:blank?query')
+ * are rejected.
+ *
+ * @param {unknown} url
+ * @returns {boolean}
+ */
+export function isPermittedBlankUrl(url) {
+  if (typeof url !== 'string') return false;
+  if (url === 'about:blank' || url.startsWith('about:blank#')) return true;
+  try {
+    const parsed = new URL(url);
+    return (
+      parsed.protocol === 'about:' &&
+      parsed.pathname.toLowerCase() === 'blank' &&
+      !parsed.search
+    );
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Checks whether a committed navigation URL violates origin confinement.
+ *
+ * @param {unknown} url
+ * @param {string} targetOrigin
+ * @returns {boolean}
+ */
+export function isAuditViolation(url, targetOrigin) {
+  if (isPermittedBlankUrl(url)) return false;
+  if (typeof url === 'string' && url.startsWith('chrome-error://')) return false;
+  let origin = null;
+  try {
+    origin = new URL(url).origin;
+  } catch {
+    origin = null;
+  }
+  return origin !== targetOrigin;
+}
+
+/**
  * Finds the first recorded main-frame commit that violates origin confinement.
  *
  * Detection only: this reports navigations that already committed; it does not
  * prevent them. Pre-commit prevention is the route layer's job. Permitted
  * commits are the declared target origin plus explicit null-origin cases:
- * `about:blank` (fresh pages, blocked-popup residue) and `chrome-error://`
- * pages (the expected residue of aborted navigations).
+ * `about:blank` and its fragment-only variants (fresh pages, blocked-popup residue)
+ * and `chrome-error://` pages (the expected residue of aborted navigations).
  *
  * @param {Array<unknown>} committedUrls - Recorded frame URLs in commit order.
  * @param {string} targetOrigin - Declared workflow target origin.
@@ -191,20 +241,69 @@ export function evaluateRefreshHeader(rawValue, baseUrl, targetOrigin) {
  */
 export function findAuditViolation(committedUrls, targetOrigin) {
   if (!Array.isArray(committedUrls)) return null;
-  for (const url of committedUrls) {
-    if (url === 'about:blank') continue;
-    if (typeof url === 'string' && url.startsWith('chrome-error://')) continue;
-    let origin = null;
-    try {
-      origin = new URL(url).origin;
-    } catch {
-      origin = null;
+  if (committedUrls.retainedViolation) {
+    if (isAuditViolation(committedUrls.retainedViolation, targetOrigin)) {
+      return typeof committedUrls.retainedViolation === 'string'
+        ? committedUrls.retainedViolation
+        : '(unavailable)';
     }
-    if (origin !== targetOrigin) {
+  }
+  for (const url of committedUrls) {
+    if (isAuditViolation(url, targetOrigin)) {
       return typeof url === 'string' ? url : '(unavailable)';
     }
   }
   return null;
+}
+
+/**
+ * Records a committed main-frame navigation into the audit history sink,
+ * deduplicating consecutive duplicates, bounding the history to approximately 1,000
+ * entries, recording truncation when older entries are discarded, and preserving
+ * any detected security violations so truncation cannot erase unsafe findings.
+ *
+ * @param {Array<unknown>} sink - Bounded audit history array.
+ * @param {unknown} url - Committed navigation URL.
+ * @param {string} [targetOrigin=null] - Optional target origin to identify violations.
+ */
+export function recordAuditCommit(sink, url, targetOrigin = null) {
+  if (!Array.isArray(sink)) return;
+
+  // 1. Avoid recording consecutive duplicate navigation entries
+  if (sink.length > 0 && sink[sink.length - 1] === url) {
+    return;
+  }
+
+  // 2. Enforce bounded history limit
+  if (sink.length >= COMMIT_AUDIT_HISTORY_LIMIT) {
+    sink.isTruncated = true;
+    sink.truncated = true;
+    sink.omittedCount = (sink.omittedCount || 0) + 1;
+    sink.omittedEntries = (sink.omittedEntries || 0) + 1;
+
+    // Discard an older entry without erasing an already-detected security violation.
+    // If targetOrigin is provided, search for and discard the oldest benign entry so
+    // that any detected violation is preserved in sink.
+    let discardIndex = -1;
+    if (targetOrigin) {
+      discardIndex = sink.findIndex((entry) => !isAuditViolation(entry, targetOrigin));
+    }
+
+    if (discardIndex === -1) {
+      // If all entries in sink are violations (or targetOrigin is omitted), discard entry 0
+      // but preserve the discarded violation in retainedViolation so it is never erased.
+      const discarded = sink.shift();
+      if (targetOrigin && isAuditViolation(discarded, targetOrigin)) {
+        if (!sink.retainedViolation) {
+          sink.retainedViolation = discarded;
+        }
+      }
+    } else {
+      sink.splice(discardIndex, 1);
+    }
+  }
+
+  sink.push(url);
 }
 
 /**
@@ -218,13 +317,18 @@ export function findAuditViolation(committedUrls, targetOrigin) {
  *
  * @param {import('../browser/browser-session.js').BrowserSession} session
  * @param {Array<string>} sink - Receives committed main-frame URLs.
+ * @param {string} [targetOrigin=null] - Target origin for confinement evaluation.
  * @returns {() => Promise<void>} Detach function for explicit cleanup.
  */
-function attachCommitAudit(session, sink) {
+function attachCommitAudit(session, sink, targetOrigin = null) {
+  if (Array.isArray(sink)) {
+    if (sink.isTruncated === undefined) sink.isTruncated = false;
+    if (sink.truncated === undefined) sink.truncated = false;
+  }
   const frameNavigatedHandler = (frame) => {
     try {
       if (frame && frame === frame.page().mainFrame()) {
-        sink.push(frame.url());
+        recordAuditCommit(sink, frame.url(), targetOrigin);
       }
     } catch {
       // Audit must never break the run.
@@ -392,7 +496,7 @@ async function enforcePopupConfinement(session, targetOrigin) {
       } catch {
         url = '';
       }
-      if (url && url !== 'about:blank') {
+      if (url && !isPermittedBlankUrl(url)) {
         let origin = null;
         try {
           origin = new URL(url).origin;
@@ -676,6 +780,8 @@ export class WorkflowPlayer {
     let crossOriginBlockedUrl = null;
     let routeFault = null;
     const committedMainFrameUrls = [];
+    committedMainFrameUrls.isTruncated = false;
+    committedMainFrameUrls.truncated = false;
     let auditDetach = null;
     const subresourcePairs = new Map();
     let subresourceOmittedEvents = 0;
@@ -855,7 +961,7 @@ export class WorkflowPlayer {
       });
 
       // Commit audit: record main-frame commits for post-close validation.
-      auditDetach = attachCommitAudit(session, committedMainFrameUrls);
+      auditDetach = attachCommitAudit(session, committedMainFrameUrls, versionObj.target.origin);
 
       // 4. Initial target navigation
       const initialUrl = new URL(versionObj.target.startPath, versionObj.target.origin);
