@@ -5,3 +5,4 @@
 export * from './errors.js';
 export * from './schema.js';
 export * from './hash.js';
+export * from './repository.js';

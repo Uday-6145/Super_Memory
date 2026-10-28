@@ -100,3 +100,67 @@ export class CorruptRecordError extends WorkflowError {
     this.filePath = options.filePath || null;
   }
 }
+
+export class WorkflowNotFoundError extends WorkflowError {
+  /**
+   * @param {string} message - Description of missing workflow or version.
+   * @param {object} [options]
+   * @param {string} [options.workflowId] - Target workflow ID.
+   * @param {number} [options.version] - Target version number, if applicable.
+   * @param {Error} [options.cause]
+   */
+  constructor(message, options = {}) {
+    super(message, { code: 'WORKFLOW_NOT_FOUND', cause: options.cause });
+    this.name = 'WorkflowNotFoundError';
+    this.workflowId = options.workflowId || null;
+    this.version = options.version || null;
+  }
+}
+
+export class WorkflowDisabledError extends WorkflowError {
+  /**
+   * @param {string} message - Description of disabled workflow.
+   * @param {object} [options]
+   * @param {string} [options.workflowId] - Target workflow ID.
+   * @param {Error} [options.cause]
+   */
+  constructor(message, options = {}) {
+    super(message, { code: 'WORKFLOW_DISABLED', cause: options.cause });
+    this.name = 'WorkflowDisabledError';
+    this.workflowId = options.workflowId || null;
+  }
+}
+
+export class NoVerifiedVersionError extends WorkflowError {
+  /**
+   * @param {string} message - Description of missing or unverified active version.
+   * @param {object} [options]
+   * @param {string} [options.workflowId] - Target workflow ID.
+   * @param {number} [options.version] - Target version number.
+   * @param {Error} [options.cause]
+   */
+  constructor(message, options = {}) {
+    super(message, { code: 'NO_VERIFIED_VERSION', cause: options.cause });
+    this.name = 'NoVerifiedVersionError';
+    this.workflowId = options.workflowId || null;
+    this.version = options.version || null;
+  }
+}
+
+export class WorkflowExecutionError extends WorkflowError {
+  /**
+   * @param {string} message - Description of runtime execution failure.
+   * @param {object} [options]
+   * @param {string} [options.workflowId] - Target workflow ID.
+   * @param {number} [options.version] - Target version number.
+   * @param {object} [options.runResult] - Full execution run report.
+   * @param {Error} [options.cause]
+   */
+  constructor(message, options = {}) {
+    super(message, { code: 'WORKFLOW_EXECUTION_FAILED', cause: options.cause });
+    this.name = 'WorkflowExecutionError';
+    this.workflowId = options.workflowId || null;
+    this.version = options.version || null;
+    this.runResult = options.runResult || null;
+  }
+}

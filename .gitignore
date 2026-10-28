@@ -35,3 +35,6 @@ ehthumbs.db
 *.swp
 *.swo
 *~
+
+# Super Memory local workflow and runtime persistence
+.super-memory/

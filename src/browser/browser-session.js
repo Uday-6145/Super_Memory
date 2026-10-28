@@ -1,3 +1,4 @@
+
 /**
  * Super Memory — Browser Session
  *
@@ -475,11 +476,11 @@ export class BrowserSession {
 
     try {
       if (this.page && !this.page.isClosed()) {
-        await this.page.close().catch(() => {});
+        await this.page.close().catch(() => { });
       }
     } finally {
       if (this.context) {
-        await this.context.close().catch(() => {});
+        await this.context.close().catch(() => { });
       }
     }
   }
