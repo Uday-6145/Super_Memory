@@ -26,6 +26,21 @@ export class ActionDecisionError extends WorkflowError {
 
 const ALLOWED_ACTIONS = new Set(['navigate', 'clickByRole', 'fillByLabel']);
 const ALLOWED_PREDICATE_TYPES = new Set(['pageTitle', 'textPresent', 'textAbsent']);
+const UNSUPPORTED_FILL_INPUT_TYPES = new Set([
+  'password',
+  'hidden',
+  'submit',
+  'button',
+  'checkbox',
+  'radio',
+  'file',
+  'image',
+  'reset',
+]);
+
+function normalizeActionText(value) {
+  return String(value || '').trim().replace(/\s+/g, ' ').toLowerCase();
+}
 
 /**
  * Builds the structured prompt messages for the model provider to obtain an ActionDecision.
@@ -96,8 +111,8 @@ JSON SCHEMA:
   "rationale": "Short justification for this action",
   "confidence": 0.9,
   "expects": {
-    "type": "textPresent" | "finalPath" | "pageTitle",
-    "expected": "expected text or path after action"
+    "type": "textPresent" | "textAbsent" | "pageTitle",
+    "expected": "expected text or page title after action"
   },
   "done": false
 }`;
@@ -250,6 +265,18 @@ export function validateActionDecision(decision, observation, intent) {
     if (typeof decision.name !== 'string' || decision.name.trim() === '') {
       throw new ActionDecisionError('clickByRole requires a non-empty "name" string.', { path: 'name' });
     }
+    if (decision.role !== targetElement.role) {
+      throw new ActionDecisionError(
+        `clickByRole role "${decision.role}" does not match observed element role "${targetElement.role}".`,
+        { path: 'role' }
+      );
+    }
+    if (normalizeActionText(decision.name) !== normalizeActionText(targetElement.name)) {
+      throw new ActionDecisionError(
+        'clickByRole accessible name does not match the referenced observed element.',
+        { path: 'name' }
+      );
+    }
   } else if (decision.action === 'fillByLabel') {
     // elementIndex validation
     if (
@@ -269,8 +296,46 @@ export function validateActionDecision(decision, observation, intent) {
       throw new ActionDecisionError('Targeting password inputs is strictly prohibited.', { path: 'elementIndex' });
     }
 
+    const elementTag = String(targetElement.tag || '').toLowerCase();
+    const elementType = String(targetElement.type || '').toLowerCase();
+    if (
+      !['input', 'textarea', 'select'].includes(elementTag) ||
+      UNSUPPORTED_FILL_INPUT_TYPES.has(elementType)
+    ) {
+      throw new ActionDecisionError(
+        'fillByLabel references an observed control that does not accept text entry.',
+        { path: 'elementIndex' }
+      );
+    }
+
     if (typeof decision.label !== 'string' || decision.label.trim() === '') {
       throw new ActionDecisionError('fillByLabel requires a non-empty "label" string.', { path: 'label' });
+    }
+
+    const normalizedLabel = normalizeActionText(decision.label);
+    const referencedNames = [
+      normalizeActionText(targetElement.name),
+      normalizeActionText(targetElement.placeholder),
+    ].filter((name) => name !== '');
+    let labelGrounded = referencedNames.includes(normalizedLabel);
+    if (!labelGrounded && referencedNames.length === 0) {
+      // The observation carries no accessible name for the referenced control (snapshot
+      // naming gaps are a known limitation). Fail closed only when the label clearly
+      // identifies a *different* observed control, which indicates a mistargeted mapping.
+      const pointsElsewhere = (observation.elements || []).some(
+        (element, index) =>
+          index !== decision.elementIndex &&
+          (normalizeActionText(element.name) === normalizedLabel ||
+            (normalizeActionText(element.placeholder) !== '' &&
+              normalizeActionText(element.placeholder) === normalizedLabel))
+      );
+      labelGrounded = !pointsElsewhere;
+    }
+    if (!labelGrounded) {
+      throw new ActionDecisionError(
+        'fillByLabel label does not correspond to the referenced observed input.',
+        { path: 'label' }
+      );
     }
 
     // inputName must be declared in TaskIntent.parameters
@@ -287,14 +352,14 @@ export function validateActionDecision(decision, observation, intent) {
     }
   }
 
-  // Expects verification predicate (optional)
+  // Expects verification predicate (optional when absent, strict when supplied).
   if (decision.expects !== undefined && decision.expects !== null) {
     if (typeof decision.expects !== 'object' || Array.isArray(decision.expects)) {
       throw new ActionDecisionError('decision.expects must be an object if provided.', { path: 'expects' });
     }
     if (!ALLOWED_PREDICATE_TYPES.has(decision.expects.type)) {
       throw new ActionDecisionError(
-        `Invalid decision.expects type "${decision.expects.type}". Allowed: ${Array.from(ALLOWED_PREDICATE_TYPES).join(', ')}`,
+        `Invalid decision.expects type "${decision.expects.type}". Allowed: ${Array.from(ALLOWED_PREDICATE_TYPES).join(', ')}.`,
         { path: 'expects.type' }
       );
     }

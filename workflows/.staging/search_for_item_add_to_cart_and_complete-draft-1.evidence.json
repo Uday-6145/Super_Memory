@@ -1,0 +1,67 @@
+{
+  "$schema": "https://supermemory.ai/schemas/workflow-evidence-1.0.0.json",
+  "schemaVersion": "1.0.0",
+  "workflowId": "search_for_item_add_to_cart_and_complete",
+  "version": 1,
+  "contentHash": "53f0a5a8cd48723331328caa6748c85b0450577a73cc0b5af36cddda4fc5d687",
+  "runId": "run_1793297157934_21dfc787",
+  "verifiedAt": "2026-10-29T18:06:01.403Z",
+  "environment": {
+    "targetOrigin": "http://127.0.0.1:8080",
+    "browserEngine": "chromium",
+    "playwrightVersion": "1.64.1",
+    "nodeVersion": "v22.19.0",
+    "platform": "darwin"
+  },
+  "stepResults": [
+    {
+      "stepId": "step_1",
+      "action": "fillByLabel",
+      "ok": true,
+      "status": null,
+      "durationMs": 595,
+      "verification": {
+        "type": "textPresent",
+        "passed": true
+      }
+    },
+    {
+      "stepId": "step_2",
+      "action": "clickByRole",
+      "ok": true,
+      "status": null,
+      "durationMs": 596,
+      "verification": {
+        "type": "textPresent",
+        "passed": true
+      }
+    },
+    {
+      "stepId": "step_3",
+      "action": "clickByRole",
+      "ok": true,
+      "status": null,
+      "durationMs": 563,
+      "verification": {
+        "type": "textPresent",
+        "passed": true
+      }
+    },
+    {
+      "stepId": "step_4",
+      "action": "clickByRole",
+      "ok": true,
+      "status": null,
+      "durationMs": 534,
+      "verification": null
+    }
+  ],
+  "successCriteriaResult": {
+    "passed": true,
+    "finalPath": true,
+    "pageTitleMatched": null,
+    "textPresentFound": null,
+    "textAbsentFound": null,
+    "details": "Success criteria passed."
+  }
+}

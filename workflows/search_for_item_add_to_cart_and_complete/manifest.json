@@ -1,0 +1,13 @@
+{
+  "schemaVersion": "1.0.0",
+  "id": "search_for_item_add_to_cart_and_complete",
+  "name": "Discovered: Search for item, add to cart, and complete checkout",
+  "description": "Discovered: Search for item, add to cart, and complete checkout",
+  "enabled": true,
+  "activeVersion": null,
+  "draftVersion": 1,
+  "timestamps": {
+    "createdAt": "2026-10-29T18:05:30.776Z",
+    "updatedAt": "2026-10-29T18:05:30.776Z"
+  }
+}

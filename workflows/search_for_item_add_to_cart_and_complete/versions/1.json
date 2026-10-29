@@ -1,0 +1,111 @@
+{
+  "schemaVersion": "1.0.0",
+  "workflowId": "search_for_item_add_to_cart_and_complete",
+  "version": 1,
+  "status": "draft",
+  "parentVersion": null,
+  "changeSummary": "Initial recorded workflow draft.",
+  "target": {
+    "origin": "http://127.0.0.1:8080",
+    "startPath": "/store"
+  },
+  "inputs": [
+    {
+      "name": "search_item",
+      "type": "string",
+      "label": "Search Product",
+      "description": "Product name to search",
+      "required": true
+    }
+  ],
+  "steps": [
+    {
+      "id": "step_1",
+      "order": 1,
+      "description": "First step is to search for item before adding to cart",
+      "action": "fillByLabel",
+      "params": {
+        "label": "Search Product",
+        "inputName": "search_item",
+        "exact": false
+      },
+      "anchor": {
+        "role": "textbox",
+        "name": "",
+        "tag": "input",
+        "type": "text",
+        "placeholder": ""
+      },
+      "verification": {
+        "type": "textPresent",
+        "expected": "Add to Cart"
+      }
+    },
+    {
+      "id": "step_2",
+      "order": 2,
+      "description": "Search completed, now add item to cart to progress toward checkout",
+      "action": "clickByRole",
+      "params": {
+        "role": "button",
+        "name": "Add to Cart",
+        "exact": false
+      },
+      "anchor": {
+        "role": "button",
+        "name": "Add to Cart",
+        "tag": "button",
+        "type": "submit",
+        "placeholder": ""
+      },
+      "verification": {
+        "type": "textPresent",
+        "expected": "cart"
+      }
+    },
+    {
+      "id": "step_3",
+      "order": 3,
+      "description": "Item added to cart, need to proceed to checkout to continue purchase flow",
+      "action": "clickByRole",
+      "params": {
+        "role": "link",
+        "name": "Proceed to Checkout",
+        "exact": false
+      },
+      "anchor": {
+        "role": "link",
+        "name": "Proceed to Checkout",
+        "tag": "a",
+        "type": "",
+        "placeholder": ""
+      },
+      "verification": {
+        "type": "textPresent",
+        "expected": "Checkout"
+      }
+    },
+    {
+      "id": "step_4",
+      "order": 4,
+      "description": "On checkout page, need to click Complete Order to finish checkout flow",
+      "action": "clickByRole",
+      "params": {
+        "role": "button",
+        "name": "Complete Order",
+        "exact": false
+      },
+      "anchor": {
+        "role": "button",
+        "name": "Complete Order",
+        "tag": "button",
+        "type": "submit",
+        "placeholder": ""
+      },
+      "verification": null
+    }
+  ],
+  "successCriteria": {
+    "finalPath": "/receipt"
+  }
+}

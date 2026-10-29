@@ -180,8 +180,12 @@ describe('Discovery Engine — Integration & Session Orchestrator', () => {
         headless: true,
       });
 
-      // Phase A: Initial discovery via CLI
-      const discResult = await cli.discover(intent, { allowLocalhost: true });
+      // Phase A: Initial discovery via CLI with explicit test approval for the
+      // controlled synthetic fixture. Production discovery defaults to safe denial.
+      const discResult = await cli.discover(intent, {
+        allowLocalhost: true,
+        approveAction: async () => true,
+      });
       assert.equal(discResult.action, 'discovered');
       assert.ok(discResult.workflowId);
       assert.equal(discResult.draft.version, 1);
@@ -433,6 +437,9 @@ describe('Discovery Engine — Integration & Session Orchestrator', () => {
       modelProvider: loopModel,
       maxSteps: 2,
       allowLocalhost: true,
+      // Explicit test approval: this test exercises the step budget, and the
+      // fixture's checkout click is consequential under the default policy.
+      approveAction: async () => true,
     });
 
     const res = await orchestrator.runDiscovery(intent);

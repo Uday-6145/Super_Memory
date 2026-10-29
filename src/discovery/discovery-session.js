@@ -26,6 +26,47 @@ export class DiscoverySessionError extends WorkflowError {
   }
 }
 
+const CONSEQUENTIAL_TEXT_PATTERNS = [
+  /order/i,
+  /checkout/i,
+  /purchase/i,
+  /payment/i,
+  /\bpay\b/i,
+  /submit/i,
+  /\bsend\b/i,
+  /delete/i,
+  /remove/i,
+];
+
+function getActionTargetText(decision, observedElement) {
+  const parts = [
+    decision?.name,
+    decision?.label,
+    decision?.path,
+    observedElement?.name,
+    observedElement?.placeholder,
+  ];
+  return parts.filter((part) => typeof part === 'string' && part.trim() !== '').join(' | ');
+}
+
+function actionRequiresApproval(decision, observedElement, intent) {
+  const targetText = getActionTargetText(decision, observedElement);
+  const normalizedTarget = targetText.toLowerCase();
+
+  for (const term of intent.approvalRequired || []) {
+    if (typeof term === 'string' && term.trim() !== '' && normalizedTarget.includes(term.toLowerCase())) {
+      return { required: true, reason: `matches TaskIntent approval-required term "${term}"` };
+    }
+  }
+
+  const matchedPattern = CONSEQUENTIAL_TEXT_PATTERNS.find((pattern) => pattern.test(targetText));
+  if (matchedPattern) {
+    return { required: true, reason: `matches consequential-action pattern ${matchedPattern}` };
+  }
+
+  return { required: false };
+}
+
 export class DiscoveryOrchestrator {
   /**
    * @param {object} options
@@ -36,6 +77,10 @@ export class DiscoveryOrchestrator {
    * @param {number} [options.maxConsecutiveInvalidDecisions=2]
    * @param {boolean} [options.allowLocalhost=false]
    * @param {Function} [options.onEvent] - Structured event callback
+   * @param {Function} [options.approveAction] - Explicit approval callback for consequential actions
+   * @param {number} [options.maxWallClockMs=300000] - Maximum discovery wall-clock duration
+   * @param {number} [options.maxTotalTokens=60000] - Maximum cumulative model tokens
+   * @param {Function} [options.now] - Injectable clock returning milliseconds, for tests
    */
   constructor({
     browserRuntime,
@@ -45,6 +90,10 @@ export class DiscoveryOrchestrator {
     maxConsecutiveInvalidDecisions = 2,
     allowLocalhost = false,
     onEvent = null,
+    approveAction = null,
+    maxWallClockMs = 300000,
+    maxTotalTokens = 60000,
+    now = null,
   } = {}) {
     if (!browserRuntime) {
       throw new DiscoverySessionError('BrowserRuntime instance is required for DiscoveryOrchestrator.');
@@ -60,6 +109,36 @@ export class DiscoveryOrchestrator {
     this.maxConsecutiveInvalidDecisions = maxConsecutiveInvalidDecisions;
     this.allowLocalhost = allowLocalhost;
     this.onEvent = onEvent;
+    this.approveAction = approveAction;
+    this.maxWallClockMs = maxWallClockMs;
+    this.maxTotalTokens = maxTotalTokens;
+    this.clockNow = typeof now === 'function' ? now : () => performance.now();
+    this.totalTokensUsed = 0;
+  }
+
+  _wallClockExceeded(startTime) {
+    if (!Number.isFinite(this.maxWallClockMs) || this.maxWallClockMs < 0) {
+      return false;
+    }
+    return this.clockNow() - startTime >= this.maxWallClockMs;
+  }
+
+  _addModelTokenUsage(usage, fallbackTokens) {
+    let tokens = 0;
+    if (usage && typeof usage === 'object') {
+      if (Number.isFinite(usage.totalTokens)) {
+        tokens = usage.totalTokens;
+      } else {
+        const inputTokens = Number.isFinite(usage.inputTokens) ? usage.inputTokens : 0;
+        const outputTokens = Number.isFinite(usage.outputTokens) ? usage.outputTokens : 0;
+        tokens = inputTokens + outputTokens;
+      }
+    }
+    if (!(tokens > 0)) {
+      tokens = fallbackTokens;
+    }
+    this.totalTokensUsed = (this.totalTokensUsed || 0) + tokens;
+    return this.totalTokensUsed;
   }
 
   /**
@@ -141,6 +220,8 @@ export class DiscoveryOrchestrator {
       .filter((v) => typeof v === 'string' && v.trim().length > 0);
 
     const trace = [];
+    const startTime = this.clockNow();
+    const maxTokensPerCall = 2048;
     let modelCallCount = 0;
     let consecutiveInvalidDecisions = 0;
     let session = null;
@@ -162,6 +243,7 @@ export class DiscoveryOrchestrator {
       let stepIndex = 0;
       let lastActionKey = null;
       let lastActionPageHash = null;
+      const attemptedConsequentialActions = new Set();
 
       while (stepIndex < this.maxSteps) {
         if (options.signal?.aborted) {
@@ -169,10 +251,14 @@ export class DiscoveryOrchestrator {
           return { status: 'CANCELLED', reason: 'Operation aborted by caller signal.', trace, eventsCount: trace.length };
         }
 
-        // Budget check
+        // Budget checks: model calls and wall-clock time terminate before further work.
         if (modelCallCount >= this.maxModelCalls) {
           state = 'ABORTED_BUDGET';
           return { status: 'ABORTED_BUDGET', reason: `Exceeded model call budget (${this.maxModelCalls}).`, trace, eventsCount: trace.length };
+        }
+        if (this._wallClockExceeded(startTime)) {
+          state = 'ABORTED_BUDGET';
+          return { status: 'ABORTED_BUDGET', reason: `Exceeded maximum discovery wall-clock duration (${this.maxWallClockMs}ms).`, trace, eventsCount: trace.length };
         }
 
         // STATE: OBSERVE
@@ -214,10 +300,24 @@ export class DiscoveryOrchestrator {
         try {
           completionResult = await this.modelProvider.complete({
             messages: promptMessages,
-            maxTokens: 1000,
+            maxTokens: maxTokensPerCall,
             timeoutMs: 30000,
+            signal: options.signal,
           });
+          this._addModelTokenUsage(completionResult?.usage, maxTokensPerCall);
+          if (Number.isFinite(this.maxTotalTokens) && this.totalTokensUsed >= this.maxTotalTokens) {
+            state = 'ABORTED_BUDGET';
+            return { status: 'ABORTED_BUDGET', reason: `Exceeded maximum cumulative model tokens (${this.maxTotalTokens}).`, trace, eventsCount: trace.length };
+          }
+          if (this._wallClockExceeded(startTime)) {
+            state = 'ABORTED_BUDGET';
+            return { status: 'ABORTED_BUDGET', reason: `Exceeded maximum discovery wall-clock duration (${this.maxWallClockMs}ms).`, trace, eventsCount: trace.length };
+          }
         } catch (err) {
+          if (options.signal?.aborted) {
+            state = 'CANCELLED';
+            return { status: 'CANCELLED', reason: 'Operation aborted by caller signal.', trace, eventsCount: trace.length };
+          }
           consecutiveInvalidDecisions++;
           if (consecutiveInvalidDecisions >= this.maxConsecutiveInvalidDecisions) {
             state = 'ABORTED_AMBIGUOUS';
@@ -300,6 +400,28 @@ export class DiscoveryOrchestrator {
           };
         }
 
+        // Target element reference
+        const observedElement =
+          decision.elementIndex !== undefined && observation.elements
+            ? observation.elements[decision.elementIndex]
+            : null;
+
+        // Consequential-action approval: deterministic policy only, never model rationale.
+        // Consequential actions are single-attempt: an uncertain outcome must not be retried blindly.
+        const approvalCheck = actionRequiresApproval(decision, observedElement, intent);
+        if (approvalCheck.required) {
+          const consequentialKey = `${decision.action}:${decision.elementIndex ?? ''}:${getActionTargetText(decision, observedElement).toLowerCase()}`;
+          if (attemptedConsequentialActions.has(consequentialKey)) {
+            state = 'ABORTED_UNVERIFIABLE';
+            return {
+              status: 'ABORTED_UNVERIFIABLE',
+              reason: `Consequential action "${actionSignature}" was already attempted once; refusing a blind retry.`,
+              trace,
+              eventsCount: trace.length,
+            };
+          }
+        }
+
         // Loop / Duplicate Prevention: if same action on same page state was already executed without state change
         if (actionSignature === lastActionKey && currentObservationHash === lastActionPageHash) {
           state = 'ABORTED_UNVERIFIABLE';
@@ -311,11 +433,64 @@ export class DiscoveryOrchestrator {
           };
         }
 
-        // Target element reference
-        const observedElement =
-          decision.elementIndex !== undefined && observation.elements
-            ? observation.elements[decision.elementIndex]
-            : null;
+        let consequentialApproval = null;
+        if (approvalCheck.required) {
+          const consequentialKey = `${decision.action}:${decision.elementIndex ?? ''}:${getActionTargetText(decision, observedElement).toLowerCase()}`;
+
+          this._emit('approval_required', {
+            stepIndex,
+            action: decision.action,
+            target: getActionTargetText(decision, observedElement),
+            reason: approvalCheck.reason,
+          });
+
+          if (typeof this.approveAction !== 'function') {
+            state = 'APPROVAL_REQUIRED';
+            return {
+              status: 'APPROVAL_REQUIRED',
+              reason: `Consequential action "${actionSignature}" requires explicit approval (${approvalCheck.reason}). No action was performed.`,
+              trace,
+              eventsCount: trace.length,
+            };
+          }
+
+          let approved = false;
+          try {
+            approved = await this.approveAction({
+              intent,
+              decision,
+              observedElement,
+              observation,
+              reason: approvalCheck.reason,
+            });
+          } catch (err) {
+            state = 'APPROVAL_REQUIRED';
+            return {
+              status: 'APPROVAL_REQUIRED',
+              reason: `Consequential action "${actionSignature}" requires explicit approval; approval callback failed: ${err.message}. No action was performed.`,
+              trace,
+              eventsCount: trace.length,
+            };
+          }
+
+          if (!approved) {
+            state = 'APPROVAL_REQUIRED';
+            return {
+              status: 'APPROVAL_REQUIRED',
+              reason: `Consequential action "${actionSignature}" was declined. No action was performed.`,
+              trace,
+              eventsCount: trace.length,
+            };
+          }
+
+          attemptedConsequentialActions.add(consequentialKey);
+          consequentialApproval = { approved: true, source: 'explicit-callback', reason: approvalCheck.reason };
+        }
+
+        if (this._wallClockExceeded(startTime)) {
+          state = 'ABORTED_BUDGET';
+          return { status: 'ABORTED_BUDGET', reason: `Exceeded maximum discovery wall-clock duration (${this.maxWallClockMs}ms).`, trace, eventsCount: trace.length };
+        }
 
         // STATE: ACT
         state = 'ACT';
@@ -352,6 +527,7 @@ export class DiscoveryOrchestrator {
           decision,
           observedElement,
           result: actionResult,
+          ...(consequentialApproval ? { approval: consequentialApproval } : {}),
         });
 
         this._emit('act', {
@@ -382,6 +558,9 @@ export class DiscoveryOrchestrator {
         // Post-action verification check
         const postSnapshot = await session.getSnapshot({ maxTextLength: 3000, maxElements: 40 });
         const postObservation = sanitizeSnapshot(postSnapshot, secrets);
+        if (trace.length > 0) {
+          trace[trace.length - 1].postObservation = postObservation;
+        }
         const autoOutcome = this._evaluateSuccessConditions(intent, postObservation);
 
         if (autoOutcome.passed) {

@@ -158,5 +158,136 @@ describe('Discovery Engine — Action Decision Processing', () => {
       /not declared in TaskIntent/
     );
   });
+
+  it('validateActionDecision rejects a valid index with a mismatched accessible name', () => {
+    const decision = {
+      action: 'clickByRole',
+      elementIndex: 1,
+      role: 'button',
+      name: 'Different Button',
+    };
+    assert.throws(
+      () => validateActionDecision(decision, observation, intent),
+      /accessible name does not match/
+    );
+  });
+
+  it('validateActionDecision rejects a valid index with a mismatched role', () => {
+    const decision = {
+      action: 'clickByRole',
+      elementIndex: 1,
+      role: 'link',
+      name: 'Search',
+    };
+    assert.throws(
+      () => validateActionDecision(decision, observation, intent),
+      /does not match observed element role/
+    );
+  });
+
+  it('validateActionDecision rejects a fill label that does not correspond to the referenced input', () => {
+    const decision = {
+      action: 'fillByLabel',
+      elementIndex: 0,
+      label: 'Unrelated Field',
+      inputName: 'itemQuery',
+    };
+    assert.throws(
+      () => validateActionDecision(decision, observation, intent),
+      /does not correspond to the referenced observed input/
+    );
+  });
+
+  it('validateActionDecision rejects fill actions against non-text controls', () => {
+    const decision = {
+      action: 'fillByLabel',
+      elementIndex: 1,
+      label: 'Search',
+      inputName: 'itemQuery',
+    };
+    assert.throws(
+      () => validateActionDecision(decision, observation, intent),
+      /does not accept text entry/
+    );
+  });
+
+  it('validateActionDecision rejects a label that identifies a different observed control', () => {
+    const twoFields = {
+      url: 'http://127.0.0.1:8080/',
+      title: 'Storefront',
+      text: 'Search our store',
+      elements: [
+        { tag: 'input', role: 'textbox', name: 'Email', type: 'text', disabled: false },
+        { tag: 'input', role: 'textbox', name: 'Search', type: 'text', disabled: false },
+      ],
+    };
+    const mistargeted = {
+      action: 'fillByLabel',
+      elementIndex: 0,
+      label: 'Search',
+      inputName: 'itemQuery',
+    };
+    assert.throws(
+      () => validateActionDecision(mistargeted, twoFields, intent),
+      /does not correspond to the referenced observed input/
+    );
+  });
+
+  it('validateActionDecision accepts an unlabeled snapshot control when the label points nowhere else', () => {
+    const unnamed = {
+      url: 'http://127.0.0.1:8080/',
+      title: 'Storefront',
+      text: 'Search our store',
+      elements: [
+        { tag: 'input', role: 'textbox', name: '', type: 'text', disabled: false },
+        { tag: 'button', role: 'button', name: 'Add to Cart', type: 'submit', disabled: false },
+      ],
+    };
+    const decision = {
+      action: 'fillByLabel',
+      elementIndex: 0,
+      label: 'Search our store',
+      inputName: 'itemQuery',
+    };
+    assert.equal(validateActionDecision(decision, unnamed, intent).valid, true);
+  });
+
+  it('validateActionDecision rejects an unsupported expects predicate type', () => {
+    const decision = {
+      action: 'clickByRole',
+      elementIndex: 1,
+      role: 'button',
+      name: 'Search',
+      expects: { type: 'finalPath', expected: '/cart' },
+    };
+    assert.throws(
+      () => validateActionDecision(decision, observation, intent),
+      /Invalid decision.expects type/
+    );
+  });
+
+  it('validateActionDecision rejects an empty expects value', () => {
+    const decision = {
+      action: 'clickByRole',
+      elementIndex: 1,
+      role: 'button',
+      name: 'Search',
+      expects: { type: 'textPresent', expected: '   ' },
+    };
+    assert.throws(
+      () => validateActionDecision(decision, observation, intent),
+      /non-empty string/
+    );
+  });
+
+  it('validateActionDecision accepts a valid decision without optional expects', () => {
+    const decision = {
+      action: 'clickByRole',
+      elementIndex: 1,
+      role: 'button',
+      name: 'Search',
+    };
+    assert.equal(validateActionDecision(decision, observation, intent).valid, true);
+  });
 });
 

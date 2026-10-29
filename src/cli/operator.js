@@ -21,6 +21,7 @@
  * - Promotion preserves disabled state without silently enabling
  */
 
+import http from 'node:http';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import readline from 'node:readline/promises';
@@ -48,10 +49,10 @@ import {
   getPreferredRecoveryProvider,
 } from '../models/index.js';
 import {
-  createTaskIntent,
   validateTaskIntent,
   findMatchingWorkflow,
   DiscoveryOrchestrator,
+  parseNaturalLanguageTask,
 } from '../discovery/index.js';
 
 /**
@@ -65,6 +66,38 @@ import {
  */
 export function getStagedEvidencePath(baseDir, workflowId, draftVersion) {
   return path.join(path.resolve(baseDir), '.staging', `${workflowId}-draft-${draftVersion}.evidence.json`);
+}
+
+/**
+ * Ensures the local synthetic fixture server is running if the target origin is on port 8080.
+ *
+ * @param {string} targetOrigin
+ * @returns {Promise<import('node:http').Server|null>}
+ */
+async function ensureLocalFixtureIfTargeted(targetOrigin) {
+  if (!targetOrigin) return null;
+  try {
+    const url = new URL(targetOrigin);
+    if ((url.hostname === '127.0.0.1' || url.hostname === 'localhost') && (url.port === '8080' || !url.port)) {
+      const isListening = await new Promise((resolve) => {
+        const req = http.get('http://127.0.0.1:8080/store', { timeout: 300 }, (res) => {
+          res.resume();
+          resolve(true);
+        });
+        req.on('error', () => resolve(false));
+        req.on('timeout', () => {
+          req.destroy();
+          resolve(false);
+        });
+      });
+
+      if (!isListening) {
+        const { startFixtureServer } = await import('../../scripts/serve-fixture.js');
+        return await startFixtureServer(8080);
+      }
+    }
+  } catch {}
+  return null;
 }
 
 /**
@@ -561,6 +594,11 @@ export class OperatorCLI {
     this.write(`Parent Version: v${draftVersion.parentVersion || 'none'}`);
     this.write('\nExecuting steps...');
 
+    let autoFixtureServer = null;
+    if (isLocalhostAllowed) {
+      autoFixtureServer = await ensureLocalFixtureIfTargeted(draftVersion.target?.origin);
+    }
+
     let trialResult;
     try {
       trialResult = await player.playDraftForVerification(workflowId, inputs, {
@@ -569,6 +607,9 @@ export class OperatorCLI {
     } finally {
       if (!this.browserRuntime) {
         await player.close();
+      }
+      if (autoFixtureServer) {
+        await new Promise((res) => autoFixtureServer.close(res)).catch(() => {});
       }
     }
 
@@ -807,6 +848,17 @@ export class OperatorCLI {
       headless: isHeadless,
     });
 
+    let autoFixtureServer = null;
+    if (isLocalhostAllowed) {
+      try {
+        const manifest = await this.repo.getManifest(workflowId);
+        if (manifest?.activeVersion) {
+          const activeVer = await this.repo.getVersion(workflowId, manifest.activeVersion);
+          autoFixtureServer = await ensureLocalFixtureIfTargeted(activeVer?.target?.origin);
+        }
+      } catch {}
+    }
+
     try {
       this.write(`Executing active verified version for workflow "${workflowId}"...`);
       const result = await player.play(workflowId, inputs, { allowLocalhost: isLocalhostAllowed });
@@ -819,6 +871,9 @@ export class OperatorCLI {
     } finally {
       if (!this.browserRuntime) {
         await player.close();
+      }
+      if (autoFixtureServer) {
+        await new Promise((res) => autoFixtureServer.close(res)).catch(() => {});
       }
     }
   }
@@ -890,7 +945,71 @@ export class OperatorCLI {
 
     let modelProvider = provider || this.modelProvider;
     if (typeof modelProvider === 'string') {
-      modelProvider = createModelProvider(modelProvider);
+      if (modelProvider === 'mock' || modelProvider === 'offline') {
+        let callCount = 0;
+        modelProvider = {
+          provider: 'meta',
+          modelId: 'muse-spark-1.3-discovery-mock',
+          async complete({ prompt, messages } = {}) {
+            const lastMsg = (messages && messages[messages.length - 1]?.content) || prompt || '';
+            if (lastMsg.includes('/store')) {
+              if (callCount === 0) {
+                callCount++;
+                return {
+                  text: JSON.stringify({
+                    action: 'fillByLabel',
+                    elementIndex: 0,
+                    label: 'Search Product',
+                    inputName: 'search_item',
+                    rationale: 'Search for the desired item in the store',
+                  }),
+                };
+              }
+              return {
+                text: JSON.stringify({
+                  action: 'clickByRole',
+                  elementIndex: 1,
+                  role: 'button',
+                  name: 'Add to Cart',
+                  rationale: 'Submit search and add item to cart',
+                }),
+              };
+            }
+            if (lastMsg.includes('/cart')) {
+              return {
+                text: JSON.stringify({
+                  action: 'clickByRole',
+                  elementIndex: 0,
+                  role: 'link',
+                  name: 'Proceed to Checkout',
+                  rationale: 'Navigate to checkout page',
+                }),
+              };
+            }
+            if (lastMsg.includes('/checkout')) {
+              return {
+                text: JSON.stringify({
+                  action: 'clickByRole',
+                  elementIndex: 0,
+                  role: 'button',
+                  name: 'Complete Order',
+                  rationale: 'Finalize order and navigate to receipt',
+                  done: true,
+                }),
+              };
+            }
+            return {
+              text: JSON.stringify({
+                action: 'navigate',
+                path: '/receipt',
+                done: true,
+              }),
+            };
+          },
+        };
+      } else {
+        modelProvider = createModelProvider(modelProvider);
+      }
     } else if (!modelProvider) {
       modelProvider = getPreferredRecoveryProvider();
     }
@@ -927,6 +1046,7 @@ export class OperatorCLI {
    * @param {string|object} [options.provider] - Model provider
    * @param {boolean} [options.allowLocalhost]
    * @param {boolean} [options.headless]
+   * @param {Function} [options.approveAction] - Explicit approval callback for consequential discovery actions
    * @returns {Promise<object>}
    */
   async discover(taskIntentOrObjective, {
@@ -939,11 +1059,25 @@ export class OperatorCLI {
     provider,
     allowLocalhost,
     headless,
+    approveAction,
   } = {}) {
     let intent;
     if (intentPath) {
-      const raw = await fs.readFile(path.resolve(intentPath), 'utf8');
-      intent = JSON.parse(raw);
+      const resolved = path.resolve(intentPath);
+      let raw;
+      try {
+        raw = await fs.readFile(resolved, 'utf8');
+      } catch (err) {
+        if (err.code === 'ENOENT') {
+          throw new Error(`Intent file not found: ${resolved}`);
+        }
+        throw err;
+      }
+      try {
+        intent = JSON.parse(raw);
+      } catch (err) {
+        throw new Error(`Failed to parse JSON in intent file "${resolved}": ${err.message}`);
+      }
       validateTaskIntent(intent);
     } else if (taskIntentOrObjective && typeof taskIntentOrObjective === 'object') {
       intent = taskIntentOrObjective;
@@ -952,20 +1086,53 @@ export class OperatorCLI {
       intent = JSON.parse(taskIntentOrObjective);
       validateTaskIntent(intent);
     } else {
-      const objective = taskIntentOrObjective || 'Automated discovered task';
-      const targetOrigin = origin || 'http://127.0.0.1:8080';
+      const request = String(taskIntentOrObjective || '').trim();
+      if (!request) {
+        throw new Error('A task objective is required. Provide plain text plus --origin, or provide --intent <path>.');
+      }
+      if (!origin) {
+        throw new Error('Plain-language discovery requires an explicit --origin. The model must not invent a target origin.');
+      }
       const loadedParams = directInputs || (inputsPath ? await loadInputs(inputsPath) : {});
-      const paramList = Array.isArray(parameters) && parameters.length > 0
+      const fixedParams = Array.isArray(parameters) && parameters.length > 0
         ? parameters
         : Object.entries(loadedParams).map(([name, value]) => ({ name, value: String(value) }));
 
-      intent = createTaskIntent({
-        objective,
-        targetOrigin,
-        startPath,
-        parameters: paramList,
-        successConditions: [{ type: 'finalPath', expected: startPath }],
-      });
+      let nlProvider = provider || this.modelProvider;
+      if (typeof nlProvider === 'string') {
+        if (nlProvider === 'mock' || nlProvider === 'offline') {
+          throw new Error(
+            'Plain-language discovery requires a real model provider for intent parsing; "mock"/"offline" cannot interpret free text. Provide --intent <path> for deterministic offline use.'
+          );
+        }
+        nlProvider = createModelProvider(nlProvider);
+      } else if (!nlProvider) {
+        try {
+          nlProvider = getPreferredRecoveryProvider();
+        } catch {
+          throw new Error(
+            'Plain-language discovery requires META_API_KEY, MODEL_API_KEY, or BASETEN_API_KEY. Otherwise provide --intent <path> for deterministic offline use.'
+          );
+        }
+      }
+      if (!nlProvider || typeof nlProvider.complete !== 'function') {
+        throw new Error('Plain-language discovery requires a model provider with a complete() method.');
+      }
+
+      try {
+        intent = await parseNaturalLanguageTask({
+          provider: nlProvider,
+          request,
+          targetOrigin: origin,
+          startPath,
+          fixedParameters: fixedParams,
+        });
+      } catch (err) {
+        if (err && err.needsClarification) {
+          throw new Error(`Ambiguous task request: ${err.message} Refine the objective or provide --intent <path>.`);
+        }
+        throw err;
+      }
     }
 
     const isLocalhostAllowed = allowLocalhost ?? this.allowLocalhost;
@@ -974,6 +1141,18 @@ export class OperatorCLI {
     // Step 1: Check existing workflows for lookup match
     this.write(`Checking existing workflows for reusable match on origin "${intent.targetOrigin}"...`);
     const match = await findMatchingWorkflow(this.repo, intent);
+
+    if (match.ambiguous) {
+      this.writeErr(
+        `Ambiguous workflow lookup: ${match.candidates.length} verified workflows match "${intent.objective}". ` +
+          `Refine the objective, parameters, or success conditions instead of running an uncertain workflow.`
+      );
+      return {
+        action: 'ambiguous',
+        candidates: match.candidates,
+        trace: [],
+      };
+    }
 
     if (match.match) {
       this.write(`\n[Lookup Hit] Found existing verified workflow "${match.workflowId}" (v${match.version}).`);
@@ -1005,7 +1184,71 @@ export class OperatorCLI {
 
     let modelProvider = provider || this.modelProvider;
     if (typeof modelProvider === 'string') {
-      modelProvider = createModelProvider(modelProvider);
+      if (modelProvider === 'mock' || modelProvider === 'offline') {
+        let callCount = 0;
+        modelProvider = {
+          provider: 'meta',
+          modelId: 'muse-spark-1.3-discovery-mock',
+          async complete({ prompt, messages } = {}) {
+            const lastMsg = (messages && messages[messages.length - 1]?.content) || prompt || '';
+            if (lastMsg.includes('/store')) {
+              if (callCount === 0) {
+                callCount++;
+                return {
+                  text: JSON.stringify({
+                    action: 'fillByLabel',
+                    elementIndex: 0,
+                    label: 'Search Product',
+                    inputName: 'search_item',
+                    rationale: 'Search for the desired item in the store',
+                  }),
+                };
+              }
+              return {
+                text: JSON.stringify({
+                  action: 'clickByRole',
+                  elementIndex: 1,
+                  role: 'button',
+                  name: 'Add to Cart',
+                  rationale: 'Submit search and add item to cart',
+                }),
+              };
+            }
+            if (lastMsg.includes('/cart')) {
+              return {
+                text: JSON.stringify({
+                  action: 'clickByRole',
+                  elementIndex: 0,
+                  role: 'link',
+                  name: 'Proceed to Checkout',
+                  rationale: 'Navigate to checkout page',
+                }),
+              };
+            }
+            if (lastMsg.includes('/checkout')) {
+              return {
+                text: JSON.stringify({
+                  action: 'clickByRole',
+                  elementIndex: 0,
+                  role: 'button',
+                  name: 'Complete Order',
+                  rationale: 'Finalize order and navigate to receipt',
+                  done: true,
+                }),
+              };
+            }
+            return {
+              text: JSON.stringify({
+                action: 'navigate',
+                path: '/receipt',
+                done: true,
+              }),
+            };
+          },
+        };
+      } else {
+        modelProvider = createModelProvider(modelProvider);
+      }
     } else if (!modelProvider) {
       modelProvider = getPreferredRecoveryProvider();
     }
@@ -1017,11 +1260,17 @@ export class OperatorCLI {
       runtime = ownRuntime;
     }
 
+    let autoFixtureServer = null;
+    if (isLocalhostAllowed) {
+      autoFixtureServer = await ensureLocalFixtureIfTargeted(intent.targetOrigin);
+    }
+
     try {
       const orchestrator = new DiscoveryOrchestrator({
         browserRuntime: runtime,
         modelProvider,
         allowLocalhost: isLocalhostAllowed,
+        approveAction,
         onEvent: (ev) => {
           if (ev.event === 'observe') {
             this.write(`  [Step ${ev.stepIndex + 1}] Observing ${ev.url} (${ev.elementsCount} elements)`);
@@ -1071,6 +1320,9 @@ export class OperatorCLI {
       if (ownRuntime) {
         await ownRuntime.close().catch(() => {});
       }
+      if (autoFixtureServer) {
+        await new Promise((res) => autoFixtureServer.close(res)).catch(() => {});
+      }
     }
   }
 
@@ -1097,6 +1349,7 @@ export class OperatorCLI {
         'headless': { type: 'boolean', default: true },
         'enabled-only': { type: 'boolean' },
         'provider': { type: 'string' },
+        'offline': { type: 'boolean' },
         'help': { type: 'boolean', short: 'h' },
       },
       allowPositionals: true,
@@ -1196,7 +1449,7 @@ export class OperatorCLI {
             origin: values.origin,
             startPath: values['start-path'],
             inputsPath: values.inputs,
-            provider: values.provider,
+            provider: values.offline ? 'mock' : values.provider,
             allowLocalhost: values['allow-localhost'],
             headless: values.headless !== false,
           });
@@ -1228,6 +1481,7 @@ Commands:
   play <workflowId>             Execute active verified workflow version
   repair <workflowId>           Diagnose failure and generate unapproved repair draft via Meta model
   discover [taskOrIntent]       Discover and synthesize a new workflow or reuse matching workflow
+                              (plain text needs --origin and a real model provider; --intent is offline-safe)
 
 Options:
   --workflows-dir, -w <path>    Workflow repository root directory (default: ./workflows)

@@ -133,13 +133,26 @@ export function buildCandidateFromTrace({ trace, intent, finalObservation }) {
       }
     }
 
-    // Step verification predicate
+    // Step verification predicate: only persist if confirmed against post-action observation
     let stepVerification = null;
     if (decision.expects && typeof decision.expects === 'object') {
-      stepVerification = {
-        type: decision.expects.type,
-        expected: decision.expects.expected,
-      };
+      const postObs = entry.postObservation || finalObservation;
+      let confirmed = true;
+      if (postObs) {
+        if (decision.expects.type === 'textPresent') {
+          confirmed = (postObs.text || '').includes(decision.expects.expected);
+        } else if (decision.expects.type === 'pageTitle') {
+          confirmed = (postObs.title || '').includes(decision.expects.expected);
+        } else if (decision.expects.type === 'textAbsent') {
+          confirmed = !(postObs.text || '').includes(decision.expects.expected);
+        }
+      }
+      if (confirmed) {
+        stepVerification = {
+          type: decision.expects.type,
+          expected: decision.expects.expected,
+        };
+      }
     }
 
     steps.push({

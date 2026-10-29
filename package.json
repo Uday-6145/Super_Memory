@@ -12,7 +12,10 @@
     "test:meta": "node --env-file=.env scripts/test-meta.js",
     "cli": "node scripts/super-memory.js",
     "demo": "node --env-file=.env scripts/demo-recovery.js",
-    "demo:offline": "node scripts/demo-recovery.js --offline"
+    "demo:offline": "node scripts/demo-recovery.js --offline",
+    "demo:discover": "node --env-file=.env scripts/demo-discovery.js",
+    "demo:discover:offline": "node scripts/demo-discovery.js --offline",
+    "fixture": "node scripts/serve-fixture.js"
   },
   "keywords": [
     "ai",

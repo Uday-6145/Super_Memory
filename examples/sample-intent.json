@@ -1,0 +1,21 @@
+{
+  "taskId": "task_sample_order",
+  "objective": "Search for item, add to cart, and complete checkout",
+  "targetOrigin": "http://127.0.0.1:8080",
+  "startPath": "/store",
+  "parameters": [
+    {
+      "name": "search_item",
+      "value": "Fresh Paneer Pizza",
+      "label": "Search Product",
+      "description": "Product name to search"
+    }
+  ],
+  "successConditions": [
+    {
+      "type": "finalPath",
+      "expected": "/receipt"
+    }
+  ]
+}
+
