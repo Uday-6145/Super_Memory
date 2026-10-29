@@ -1430,5 +1430,11 @@ describe('Operator CLI (Phase 3D)', () => {
       assert.equal(playAfter.ok, true);
       assert.equal(playAfter.version, 2);
     });
+
+    it('executes standalone demo-recovery.js script in offline mode cleanly', async () => {
+      const { runDemonstration } = await import('../../scripts/demo-recovery.js');
+      const exitCode = await runDemonstration(['--offline']);
+      assert.equal(exitCode, 0);
+    });
   });
 });

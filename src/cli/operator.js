@@ -43,7 +43,10 @@ import {
 } from '../workflow/index.js';
 
 import { createBrowserRuntime } from '../browser/index.js';
-import { getPreferredRecoveryProvider } from '../models/index.js';
+import {
+  createModelProvider,
+  getPreferredRecoveryProvider,
+} from '../models/index.js';
 
 /**
  * Returns the default staging path for trial verification evidence.
@@ -865,19 +868,26 @@ export class OperatorCLI {
     this.write('Collecting failure diagnostics and DOM snapshot...');
 
     const failedStep = activeVersion.steps?.find((s) => s.id === runResult.failedStepId) || null;
-    const diagnostic = await collectFailureDiagnostic({
-      workflowId,
-      version: activeVersion.version,
-      error: runResult.error,
-      failedStep,
-      session: null,
-      secrets,
-    });
+    const diagnostic =
+      runResult.diagnostic ||
+      (await collectFailureDiagnostic({
+        workflowId,
+        version: activeVersion.version,
+        error: runResult.error,
+        failedStep,
+        session: null,
+        secrets,
+      }));
 
     this.write(`Failure Category: ${diagnostic.category}`);
     this.write('Generating repair proposal using Meta reasoning model...');
 
-    const modelProvider = provider || this.modelProvider || getPreferredRecoveryProvider();
+    let modelProvider = provider || this.modelProvider;
+    if (typeof modelProvider === 'string') {
+      modelProvider = createModelProvider(modelProvider);
+    } else if (!modelProvider) {
+      modelProvider = getPreferredRecoveryProvider();
+    }
     const proposalResult = await generateRepairProposal(modelProvider, diagnostic, activeVersion);
     const proposal = proposalResult.proposal;
 

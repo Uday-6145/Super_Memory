@@ -216,54 +216,33 @@ Promotion requires intentional operator confirmation:
 
 ---
 
-## Complete Recovery Demonstration (Local Fixture)
+## Complete Recovery Demonstration (`scripts/demo-recovery.js`)
 
-The full recovery lifecycle follows this deterministic sequence against local test fixtures:
+Super Memory provides an automated, reproducible end-to-end demonstration runner that spins up an isolated temporary repository and a local HTTP website fixture, executes the complete recovery lifecycle, and verifies all safety invariants:
 
 ```bash
-# 1. Inspect existing broken workflow (e.g. Website changed "Submit Order" button to "Complete Order")
-node scripts/super-memory.js inspect wf_checkout_order
+# Run demonstration with live Meta reasoning model (requires META_API_KEY or BASETEN_API_KEY in .env):
+npm run demo
 
-# 2. Ordinary playback fails on outdated selector
-node scripts/super-memory.js play wf_checkout_order --inputs inputs.json --allow-localhost
-# Output: Playback failed on step: Action timed out waiting for button "Submit Order"
+# Or run 100% offline using deterministic mock provider (zero credentials needed, runs anywhere):
+npm run demo:offline
 
-# 3. Model-assisted repair diagnoses failure and creates unapproved draft v2
-node scripts/super-memory.js repair wf_checkout_order --inputs inputs.json --allow-localhost
-# Output:
-#   Failure Category: ELEMENT_NOT_FOUND
-#   Generating repair proposal using Meta reasoning model...
-#   Created unapproved draft v2.
-
-# 4. Operator reviews the proposed step diff (read-only)
-node scripts/super-memory.js review wf_checkout_order
-# Output:
-#   [Modified] Step 2 (step_order):
-#     - target: {"role":"button","name":"Submit Order"}
-#     + target: {"role":"button","name":"Complete Order"}
-
-# 5. Ordinary playback STILL runs active v1 and still fails (draft isolation)
-node scripts/super-memory.js play wf_checkout_order --inputs inputs.json --allow-localhost
-# Output: Playback failed: active version v1 encountered an error...
-
-# 6. Operator trials draft v2 in real browser environment
-node scripts/super-memory.js trial wf_checkout_order --inputs inputs.json --allow-localhost
-# Output:
-#   [OK] Step 1: fillByLabel [step_fill] (42ms)
-#   [OK] Step 2: clickByRole [step_order] (58ms)
-#   Success Criteria: [PASSED] finalPath: /complete
-#   TRIAL VERDICT: PASSED (Candidate Ready For Explicit Promotion)
-#   Evidence saved to: .staging/wf_checkout_order-draft-2.evidence.json
-
-# 7. Operator explicitly confirms promotion
-node scripts/super-memory.js promote wf_checkout_order
-# Prompt: To confirm promotion of draft v2 to active status, type "PROMOTE wf_checkout_order": PROMOTE wf_checkout_order
-# Output: Promotion successful! Workflow "wf_checkout_order" active version is now v2.
-
-# 8. Ordinary playback now runs promoted v2 and succeeds!
-node scripts/super-memory.js play wf_checkout_order --inputs inputs.json --allow-localhost
-# Output: Playback succeeded! Active version v2 finished in 182ms.
+# To run with a visible Chromium browser window:
+node --env-file=.env scripts/demo-recovery.js --no-headless
 ```
+
+### Demonstration Steps & Invariant Verifications
+
+1. **Step 1 — Baseline Creation:** Creates an initial workflow (`wf_demo_recovery`) in a temporary workspace, trials it in Chromium, and promotes it to active `v1`.
+2. **Step 2 — Baseline Playback:** Confirms that ordinary playback (`play`) executes active `v1` successfully.
+3. **Step 3 — Breaking Change:** Updates the synthetic checkout page button from `"Submit Order"` to `"Complete Order"`.
+4. **Step 4 — Playback Failure:** Verifies that active `v1` fails safely on the renamed button, capturing an `ELEMENT_NOT_FOUND` diagnostic and DOM snapshot without leaking secrets.
+5. **Step 5 — Model Repair:** Meta reasoning model (`muse-spark-1.3`) analyzes the failure and DOM snapshot, proposing `clickByRole` targeting `"Complete Order"`. Validates schema and branches unapproved draft `v2`.
+6. **Step 6 — Operator Review:** Displays a read-only unified diff highlighting the exact step modification.
+7. **Step 7 — Draft Isolation:** Confirms that ordinary playback (`play`) strictly continues to run active `v1` and still fails (unapproved drafts are never executed in normal playback).
+8. **Step 8 — Draft Trial:** Executes a genuine browser trial on draft `v2`, verifies that the success criteria (`/complete`) passed, and stages verification evidence bound to the draft content hash.
+9. **Step 9 — Explicit Promotion:** Verifies that promotion requires intentional confirmation (`PROMOTE wf_demo_recovery`), transitions active version to `v2`, and clears the draft.
+10. **Step 10 — Recovered Playback:** Confirms that ordinary playback now executes promoted active `v2` and succeeds!
 
 ---
 

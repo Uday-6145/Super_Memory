@@ -10,7 +10,9 @@
     "test:browser": "node --test \"tests/browser/**/*.test.js\"",
     "test:baseten": "node --env-file=.env scripts/test-baseten.js",
     "test:meta": "node --env-file=.env scripts/test-meta.js",
-    "cli": "node scripts/super-memory.js"
+    "cli": "node scripts/super-memory.js",
+    "demo": "node --env-file=.env scripts/demo-recovery.js",
+    "demo:offline": "node scripts/demo-recovery.js --offline"
   },
   "keywords": [
     "ai",
