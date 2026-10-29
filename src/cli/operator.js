@@ -47,6 +47,12 @@ import {
   createModelProvider,
   getPreferredRecoveryProvider,
 } from '../models/index.js';
+import {
+  createTaskIntent,
+  validateTaskIntent,
+  findMatchingWorkflow,
+  DiscoveryOrchestrator,
+} from '../discovery/index.js';
 
 /**
  * Returns the default staging path for trial verification evidence.
@@ -908,6 +914,167 @@ export class OperatorCLI {
   }
 
   /**
+   * Discovers a new workflow or reuses an existing matching workflow for a task.
+   *
+   * @param {string|object} taskIntentOrObjective - TaskIntent object, JSON string, or NL objective string
+   * @param {object} [options]
+   * @param {string} [options.intentPath] - Path to JSON file containing TaskIntent
+   * @param {string} [options.origin] - Target origin
+   * @param {string} [options.startPath='/'] - Start path
+   * @param {Array<{ name: string, value: string }>} [options.parameters=[]]
+   * @param {string} [options.inputsPath] - Path to JSON file containing runtime input parameters
+   * @param {object} [options.inputs] - Direct input parameters
+   * @param {string|object} [options.provider] - Model provider
+   * @param {boolean} [options.allowLocalhost]
+   * @param {boolean} [options.headless]
+   * @returns {Promise<object>}
+   */
+  async discover(taskIntentOrObjective, {
+    intentPath,
+    origin,
+    startPath = '/',
+    parameters = [],
+    inputsPath,
+    inputs: directInputs,
+    provider,
+    allowLocalhost,
+    headless,
+  } = {}) {
+    let intent;
+    if (intentPath) {
+      const raw = await fs.readFile(path.resolve(intentPath), 'utf8');
+      intent = JSON.parse(raw);
+      validateTaskIntent(intent);
+    } else if (taskIntentOrObjective && typeof taskIntentOrObjective === 'object') {
+      intent = taskIntentOrObjective;
+      validateTaskIntent(intent);
+    } else if (typeof taskIntentOrObjective === 'string' && taskIntentOrObjective.trim().startsWith('{')) {
+      intent = JSON.parse(taskIntentOrObjective);
+      validateTaskIntent(intent);
+    } else {
+      const objective = taskIntentOrObjective || 'Automated discovered task';
+      const targetOrigin = origin || 'http://127.0.0.1:8080';
+      const loadedParams = directInputs || (inputsPath ? await loadInputs(inputsPath) : {});
+      const paramList = Array.isArray(parameters) && parameters.length > 0
+        ? parameters
+        : Object.entries(loadedParams).map(([name, value]) => ({ name, value: String(value) }));
+
+      intent = createTaskIntent({
+        objective,
+        targetOrigin,
+        startPath,
+        parameters: paramList,
+        successConditions: [{ type: 'finalPath', expected: startPath }],
+      });
+    }
+
+    const isLocalhostAllowed = allowLocalhost ?? this.allowLocalhost;
+    const isHeadless = headless ?? this.headless;
+
+    // Step 1: Check existing workflows for lookup match
+    this.write(`Checking existing workflows for reusable match on origin "${intent.targetOrigin}"...`);
+    const match = await findMatchingWorkflow(this.repo, intent);
+
+    if (match.match) {
+      this.write(`\n[Lookup Hit] Found existing verified workflow "${match.workflowId}" (v${match.version}).`);
+      this.write('Reusing verified workflow without model discovery calls...');
+
+      const inputs = directInputs || (inputsPath ? await loadInputs(inputsPath) : {});
+      for (const p of intent.parameters || []) {
+        if (inputs[p.name] === undefined) {
+          inputs[p.name] = p.value;
+        }
+      }
+
+      const playResult = await this.play(match.workflowId, {
+        inputs,
+        allowLocalhost: isLocalhostAllowed,
+        headless: isHeadless,
+      });
+
+      return {
+        action: 'reused',
+        workflowId: match.workflowId,
+        version: match.version,
+        result: playResult,
+      };
+    }
+
+    // Step 2: Discovery session
+    this.write('[Lookup Miss] No matching workflow found. Initiating discovery session...');
+
+    let modelProvider = provider || this.modelProvider;
+    if (typeof modelProvider === 'string') {
+      modelProvider = createModelProvider(modelProvider);
+    } else if (!modelProvider) {
+      modelProvider = getPreferredRecoveryProvider();
+    }
+
+    let ownRuntime = null;
+    let runtime = this.browserRuntime;
+    if (!runtime) {
+      ownRuntime = await createBrowserRuntime({ headless: isHeadless });
+      runtime = ownRuntime;
+    }
+
+    try {
+      const orchestrator = new DiscoveryOrchestrator({
+        browserRuntime: runtime,
+        modelProvider,
+        allowLocalhost: isLocalhostAllowed,
+        onEvent: (ev) => {
+          if (ev.event === 'observe') {
+            this.write(`  [Step ${ev.stepIndex + 1}] Observing ${ev.url} (${ev.elementsCount} elements)`);
+          } else if (ev.event === 'decide') {
+            this.write(`  [Step ${ev.stepIndex + 1}] Action: ${ev.action} -> ${ev.name || ev.label || ''}`);
+          }
+        },
+      });
+
+      const discoveryRes = await orchestrator.runDiscovery(intent);
+
+      if (discoveryRes.status !== 'SUCCESS') {
+        this.writeErr(`Discovery failed: ${discoveryRes.status} (${discoveryRes.reason || 'unverifiable'})`);
+        return {
+          action: 'failed',
+          status: discoveryRes.status,
+          reason: discoveryRes.reason,
+          trace: discoveryRes.trace,
+        };
+      }
+
+      this.write('\nDiscovery outcome verified! Converting trace to candidate workflow draft...');
+      await this.repo.createWorkflow({
+        id: discoveryRes.candidate.workflowId,
+        name: discoveryRes.candidate.changeSummary || 'Discovered Workflow',
+        description: discoveryRes.candidate.changeSummary || 'Discovered Workflow',
+        target: discoveryRes.candidate.target,
+        inputs: discoveryRes.candidate.inputs,
+        steps: discoveryRes.candidate.steps,
+        successCriteria: discoveryRes.candidate.successCriteria,
+      });
+
+      this.write(`Successfully created workflow "${discoveryRes.candidate.workflowId}" with unapproved draft v1.`);
+      this.write(`Content Hash:     ${discoveryRes.contentHash}`);
+      this.write(`To review draft:  node scripts/super-memory.js inspect ${discoveryRes.candidate.workflowId}`);
+      this.write(`To trial draft:   node scripts/super-memory.js trial ${discoveryRes.candidate.workflowId} --inputs <file>`);
+      this.write(`To promote draft: node scripts/super-memory.js promote ${discoveryRes.candidate.workflowId}`);
+
+      return {
+        action: 'discovered',
+        workflowId: discoveryRes.candidate.workflowId,
+        draft: discoveryRes.candidate,
+        contentHash: discoveryRes.contentHash,
+        trace: discoveryRes.trace,
+      };
+    } finally {
+      if (ownRuntime) {
+        await ownRuntime.close().catch(() => {});
+      }
+    }
+  }
+
+  /**
    * CLI Dispatcher / Command Router
    *
    * @param {string[]} argv
@@ -919,6 +1086,9 @@ export class OperatorCLI {
       options: {
         'workflows-dir': { type: 'string', short: 'w' },
         'inputs': { type: 'string', short: 'i' },
+        'intent': { type: 'string' },
+        'origin': { type: 'string' },
+        'start-path': { type: 'string' },
         'evidence': { type: 'string' },
         'evidence-out': { type: 'string' },
         'confirm': { type: 'string' },
@@ -1020,6 +1190,18 @@ export class OperatorCLI {
           });
           return 0;
 
+        case 'discover':
+          await this.discover(targetId, {
+            intentPath: values.intent,
+            origin: values.origin,
+            startPath: values['start-path'],
+            inputsPath: values.inputs,
+            provider: values.provider,
+            allowLocalhost: values['allow-localhost'],
+            headless: values.headless !== false,
+          });
+          return 0;
+
         default:
           this.writeErr(`Error: Unknown command "${command}". Run "super-memory --help" for available commands.`);
           return 1;
@@ -1032,10 +1214,10 @@ export class OperatorCLI {
 
   printHelp() {
     this.write(`
-Super Memory — Operator CLI for Intelligent Recovery
+Super Memory — Operator CLI for Intelligent Recovery & Discovery
 
 Usage:
-  super-memory <command> [workflowId] [options]
+  super-memory <command> [argument] [options]
 
 Commands:
   list                          List all workflows and their active/draft status
@@ -1045,10 +1227,14 @@ Commands:
   promote <workflowId>          Explicitly promote verified draft to active verified version
   play <workflowId>             Execute active verified workflow version
   repair <workflowId>           Diagnose failure and generate unapproved repair draft via Meta model
+  discover [taskOrIntent]       Discover and synthesize a new workflow or reuse matching workflow
 
 Options:
   --workflows-dir, -w <path>    Workflow repository root directory (default: ./workflows)
   --inputs, -i <path>           JSON file containing workflow runtime inputs
+  --intent <path>               Path to TaskIntent JSON file (for discover)
+  --origin <url>                Target origin URL (for discover)
+  --start-path <path>           Starting relative path (for discover)
   --evidence <path>             Path to trial verification evidence (for promote)
   --evidence-out <path>         Path to write trial verification evidence (for trial)
   --confirm <phrase>            Operator confirmation phrase (PROMOTE <workflowId>)
