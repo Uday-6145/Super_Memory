@@ -63,6 +63,7 @@ import {
   HOME_ENV_VAR,
 } from '../config/home.js';
 import { appendAuditEvent } from '../config/audit.js';
+import { migrateRepository } from '../workflow/migration.js';
 import { scanRepositoryIntegrity } from '../workflow/integrity.js';
 
 /**
@@ -959,6 +960,40 @@ export class OperatorCLI {
    * Helper: Play active verified version (ordinary playback)
    */
   /**
+   * Imports workflows from a source repository into the active repository.
+   * Copy-only, hash-validated, never overwrites; safe to repeat.
+   *
+   * @param {string} sourceDir
+   * @returns {Promise<{ imported: object[], skipped: object[] }>}
+   */
+  async migrateRepository(sourceDir) {
+    if (!sourceDir) {
+      throw new WorkflowError('migrate requires --from <source-repository>.');
+    }
+    if (this._isManagedRepository()) {
+      await ensureSuperMemoryHome({ home: this.homeDir });
+    }
+    this.write(`Importing workflows from "${path.resolve(sourceDir)}" into "${this.repo.baseDir}"...`);
+    const report = await migrateRepository({ sourceDir, destinationDir: this.repo.baseDir });
+    for (const item of report.imported) {
+      this.write(`  Imported: ${item.workflowId} (versions: ${item.versions.join(', ')})`);
+      await this._audit({
+        type: 'import',
+        workflowId: item.workflowId,
+        version: item.versions[item.versions.length - 1],
+        contentHash: item.contentHashes[item.versions[item.versions.length - 1]],
+        source: path.resolve(sourceDir),
+        imported: item.versions.length,
+      });
+    }
+    for (const item of report.skipped) {
+      this.write(`  Skipped: ${item.workflowId} (${item.reason})`);
+    }
+    this.write(`Import complete: ${report.imported.length} imported, ${report.skipped.length} skipped.`);
+    return report;
+  }
+
+  /**
    * Runs a read-only integrity scan over the active repository.
    */
   async integrityScan() {
@@ -1532,6 +1567,7 @@ export class OperatorCLI {
         'start-path': { type: 'string' },
         'evidence': { type: 'string' },
         'evidence-out': { type: 'string' },
+        'from': { type: 'string' },
         'confirm': { type: 'string' },
         'yes': { type: 'boolean', short: 'y' },
         'allow-localhost': { type: 'boolean' },
@@ -1574,6 +1610,14 @@ export class OperatorCLI {
         case 'list':
         case 'ls':
           await this.list({ enabledOnly: Boolean(values['enabled-only']) });
+          return 0;
+
+        case 'migrate':
+          if (!values.from) {
+            this.writeErr('Error: Missing required option --from <source-repository> for "migrate".');
+            return 1;
+          }
+          await this.migrateRepository(values.from);
           return 0;
 
         case 'integrity':
@@ -1687,10 +1731,12 @@ Commands:
   repair <workflowId>           Diagnose failure and generate unapproved repair draft via Meta model
   discover [taskOrIntent]       Discover and synthesize a new workflow or reuse matching workflow
                               (plain text needs --origin and a real model provider; --intent is offline-safe)
+  migrate --from <repo>         Import workflows from another repository (copy-only, hash-validated)
   integrity                     Read-only integrity scan of the active repository
 
 Options:
   --workflows-dir, -w <path>    Workflow repository root directory (default: managed home, SUPER_MEMORY_HOME)
+  --from <path>                 Source repository (migrate) or backup directory (restore)
   --inputs, -i <path>           JSON file containing workflow runtime inputs
   --intent <path>               Path to TaskIntent JSON file (for discover)
   --origin <url>                Target origin URL (for discover)
