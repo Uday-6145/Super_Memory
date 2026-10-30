@@ -21,6 +21,54 @@ import {
 
 const WORKFLOW_ID_REGEX = /^[a-z0-9][a-z0-9_-]{2,63}$/;
 const INPUT_NAME_REGEX = /^[a-zA-Z][a-zA-Z0-9_]{0,49}$/;
+
+/**
+ * Returns true when a success-criterion value is a parameter reference of the
+ * form {"input": "<declared-input-name>"} (schemaVersion 1.1.0).
+ *
+ * @param {*} value
+ * @returns {boolean}
+ */
+export function isCriterionInputRef(value) {
+  return (
+    value !== null &&
+    typeof value === 'object' &&
+    !Array.isArray(value) &&
+    typeof value.input === 'string'
+  );
+}
+
+/**
+ * Resolves parameter-bound success criteria against runtime input values,
+ * entirely locally. Literal criteria pass through unchanged. The resolved
+ * literal values are sensitive runtime data and must never be persisted,
+ * logged, or sent to a model provider.
+ *
+ * @param {object} criteria - Workflow successCriteria (may contain input refs)
+ * @param {object} providedInputs - Runtime input values by name
+ * @returns {{ criteria: object, unresolved: string[] }} Literal criteria plus
+ *   the names (never values) of references that could not be resolved.
+ */
+export function resolveSuccessCriteria(criteria, providedInputs = {}) {
+  const resolved = {};
+  const unresolved = [];
+  if (!criteria || typeof criteria !== 'object' || Array.isArray(criteria)) {
+    return { criteria: resolved, unresolved };
+  }
+  for (const [key, value] of Object.entries(criteria)) {
+    if (typeof value === 'string') {
+      resolved[key] = value;
+    } else if (isCriterionInputRef(value)) {
+      const inputValue = providedInputs ? providedInputs[value.input] : undefined;
+      if (typeof inputValue === 'string' && inputValue.trim() !== '') {
+        resolved[key] = inputValue;
+      } else {
+        unresolved.push(value.input);
+      }
+    }
+  }
+  return { criteria: resolved, unresolved };
+}
 const ISO_8601_REGEX = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:\d{2})$/;
 const HEX_64_REGEX = /^[a-f0-9]{64}$/;
 const RUN_ID_REGEX = /^[a-zA-Z0-9_-]{1,64}$/;
@@ -357,9 +405,9 @@ export function validateWorkflowVersion(version) {
     throw new WorkflowValidationError('Optional "$schema" must be a non-empty string.', { path: '$schema' });
   }
 
-  if (version.schemaVersion !== '1.0.0') {
+  if (version.schemaVersion !== '1.0.0' && version.schemaVersion !== '1.1.0') {
     throw new WorkflowValidationError(
-      `Unsupported schemaVersion "${version.schemaVersion}". Only "1.0.0" is supported.`,
+      `Unsupported schemaVersion "${version.schemaVersion}". Supported versions: "1.0.0", "1.1.0".`,
       { path: 'schemaVersion' }
     );
   }
@@ -625,10 +673,40 @@ export function validateWorkflowVersion(version) {
   for (const key of ['pageTitle', 'textPresent', 'textAbsent']) {
     if (version.successCriteria[key] !== undefined) {
       const val = version.successCriteria[key];
-      if (typeof val !== 'string' || val.trim() === '' || val.length > 500) {
-        throw new WorkflowValidationError(`successCriteria.${key} must be a non-empty string of at most 500 characters.`, {
-          path: `successCriteria.${key}`,
-        });
+      if (typeof val === 'string') {
+        if (val.trim() === '' || val.length > 500) {
+          throw new WorkflowValidationError(`successCriteria.${key} must be a non-empty string of at most 500 characters.`, {
+            path: `successCriteria.${key}`,
+          });
+        }
+      } else if (isCriterionInputRef(val)) {
+        // Parameter-bound criteria (schemaVersion 1.1.0 only). The reference is
+        // inert data: it names a declared input and is resolved locally at
+        // runtime. It is never parsed as a template.
+        if (version.schemaVersion !== '1.1.0') {
+          throw new WorkflowValidationError(
+            `successCriteria.${key} uses an input reference, which requires schemaVersion "1.1.0".`,
+            { path: `successCriteria.${key}` }
+          );
+        }
+        assertExactKeys(val, ['input'], `successCriteria.${key}`);
+        if (typeof val.input !== 'string' || !INPUT_NAME_REGEX.test(val.input)) {
+          throw new WorkflowValidationError(
+            `successCriteria.${key}.input must be a valid declared input name.`,
+            { path: `successCriteria.${key}.input` }
+          );
+        }
+        if (!declaredInputNames.has(val.input)) {
+          throw new WorkflowValidationError(
+            `successCriteria.${key} references undeclared input "${val.input}". Only declared workflow inputs may be referenced.`,
+            { path: `successCriteria.${key}.input` }
+          );
+        }
+      } else {
+        throw new WorkflowValidationError(
+          `successCriteria.${key} must be a non-empty string or an input reference {"input": "<declared-input-name>"}.`,
+          { path: `successCriteria.${key}` }
+        );
       }
     }
   }

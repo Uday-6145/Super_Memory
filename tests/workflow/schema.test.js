@@ -548,4 +548,89 @@ describe('Workflow Schema Validation', () => {
       );
     });
   });
+
+  describe('Parameter-bound success criteria (schemaVersion 1.1.0)', () => {
+    function getParameterizedVersion() {
+      const version = getValidVersion();
+      version.schemaVersion = '1.1.0';
+      version.inputs = [
+        { name: 'searchQuery', type: 'string', label: 'Search Query', description: 'Terms to search for', required: true },
+        { name: 'search_item', type: 'string', label: 'Search Item', required: true },
+      ];
+      version.successCriteria = { finalPath: '/', textPresent: { input: 'search_item' } };
+      return version;
+    }
+
+    it('accepts a declared input reference under schemaVersion 1.1.0', () => {
+      assert.doesNotThrow(() => validateWorkflowVersion(getParameterizedVersion()));
+    });
+
+    it('rejects an input reference under schemaVersion 1.0.0', () => {
+      const version = getParameterizedVersion();
+      version.schemaVersion = '1.0.0';
+      assert.throws(
+        () => validateWorkflowVersion(version),
+        (err) => err instanceof WorkflowValidationError && err.message.includes('requires schemaVersion "1.1.0"')
+      );
+    });
+
+    it('rejects a reference to an undeclared input', () => {
+      const version = getParameterizedVersion();
+      version.successCriteria.textPresent = { input: 'other_input' };
+      assert.throws(
+        () => validateWorkflowVersion(version),
+        (err) => err instanceof WorkflowValidationError && err.message.includes('references undeclared input')
+      );
+    });
+
+    it('rejects a reference with extra keys', () => {
+      const version = getParameterizedVersion();
+      version.successCriteria.textPresent = { input: 'search_item', value: 'Paneer Toast' };
+      assert.throws(
+        () => validateWorkflowVersion(version),
+        (err) => err instanceof WorkflowValidationError
+      );
+    });
+
+    it('rejects finalPath input references (literal-only)', () => {
+      const version = getParameterizedVersion();
+      version.successCriteria.finalPath = { input: 'search_item' };
+      assert.throws(
+        () => validateWorkflowVersion(version),
+        (err) => err instanceof WorkflowValidationError && err.path === 'successCriteria.finalPath'
+      );
+    });
+
+    it('rejects an unknown schemaVersion', () => {
+      const version = getParameterizedVersion();
+      version.schemaVersion = '2.0.0';
+      assert.throws(
+        () => validateWorkflowVersion(version),
+        (err) => err instanceof WorkflowValidationError && err.message.includes('Unsupported schemaVersion')
+      );
+    });
+
+    it('resolveSuccessCriteria resolves refs from runtime inputs and passes literals through', async () => {
+      const { resolveSuccessCriteria } = await import('../../src/workflow/schema.js');
+      const { criteria, unresolved } = resolveSuccessCriteria(
+        { finalPath: '/cart', textPresent: { input: 'search_item' } },
+        { search_item: 'Paneer Toast' }
+      );
+      assert.deepEqual(criteria, { finalPath: '/cart', textPresent: 'Paneer Toast' });
+      assert.deepEqual(unresolved, []);
+    });
+
+    it('resolveSuccessCriteria fails closed (names input, never value) for missing/empty/non-string values', async () => {
+      const { resolveSuccessCriteria } = await import('../../src/workflow/schema.js');
+      for (const provided of [{}, { search_item: '   ' }, { search_item: 42 }]) {
+        const { criteria, unresolved } = resolveSuccessCriteria(
+          { textPresent: { input: 'search_item' } },
+          provided
+        );
+        assert.equal(criteria.textPresent, undefined);
+        assert.deepEqual(unresolved, ['search_item']);
+        assert.ok(!JSON.stringify(unresolved).includes('42'));
+      }
+    });
+  });
 });

@@ -529,9 +529,11 @@ export class FileSystemWorkflowRepository {
    * @param {Array<object>} params.inputs
    * @param {Array<object>} params.steps
    * @param {object} params.successCriteria
+   * @param {string} [params.schemaVersion] - Workflow version schema (default "1.0.0";
+   *   "1.1.0" enables parameter-bound success criteria)
    * @returns {Promise<{ manifest: object, version: object }>}
    */
-  async createWorkflow({ id, name, description, target, inputs, steps, successCriteria }) {
+  async createWorkflow({ id, name, description, target, inputs, steps, successCriteria, schemaVersion = '1.0.0' }) {
     return this._withLock(id, async () => {
       const existingManifest = await this.getManifest(id);
       if (existingManifest) {
@@ -552,7 +554,7 @@ export class FileSystemWorkflowRepository {
       const now = new Date().toISOString();
 
       const versionObj = {
-        schemaVersion: '1.0.0',
+        schemaVersion,
         workflowId: id,
         version: 1,
         status: 'draft',
@@ -647,7 +649,9 @@ export class FileSystemWorkflowRepository {
       const nextVersion = Math.max(0, manifest.activeVersion ?? 0, manifest.draftVersion ?? 0, ...occupiedVersions) + 1;
 
       const newVersionObj = {
-        schemaVersion: '1.0.0',
+        // Branching preserves the source schema version so parameter-bound
+        // criteria (1.1.0) are not silently downgraded into an invalid draft.
+        schemaVersion: activeVersion.schemaVersion ?? '1.0.0',
         workflowId,
         version: nextVersion,
         status: 'draft',
@@ -727,7 +731,8 @@ export class FileSystemWorkflowRepository {
       const updatedVersion = {
         ...currentVersion,
         ...updates,
-        schemaVersion: '1.0.0',
+        // Updates never change the schema version; a 1.1.0 draft stays 1.1.0.
+        schemaVersion: currentVersion.schemaVersion ?? '1.0.0',
         workflowId,
         version: versionNumber,
         status: 'draft',

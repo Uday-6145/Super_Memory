@@ -44,7 +44,7 @@ import {
   WorkflowExecutionError,
 } from './errors.js';
 
-import { validateWorkflowId, verifyEvidenceMatchesWorkflow } from './schema.js';
+import { validateWorkflowId, verifyEvidenceMatchesWorkflow, resolveSuccessCriteria } from './schema.js';
 import { calculateContentHash } from './hash.js';
 import { collectFailureDiagnostic } from './diagnostics.js';
 import { createBrowserRuntime, ActionError } from '../browser/index.js';
@@ -888,6 +888,21 @@ export class WorkflowPlayer {
 
     // 2. Validate all runtime inputs before browser initialization
     validateRuntimeInputs(versionObj.inputs, inputs, workflowId);
+
+    // 2b. Preflight: every input referenced by the success criteria must
+    // resolve from the validated runtime inputs BEFORE any browser session
+    // or workflow action begins. An optional input that is referenced by a
+    // criterion is therefore required for this run; omitting it must not
+    // launch the browser only to fail after side effects. The error names
+    // inputs only, never their values.
+    const { unresolved: unresolvedCriteriaRefs } = resolveSuccessCriteria(versionObj.successCriteria, inputs);
+    if (unresolvedCriteriaRefs.length > 0) {
+      throw new WorkflowValidationError(
+        `Success criteria reference runtime inputs that were not supplied with usable values: ${[...new Set(unresolvedCriteriaRefs)].join(', ')}.`,
+        { path: 'successCriteria' }
+      );
+    }
+
     const inputSecrets = Object.values(inputs).filter((value) => typeof value === 'string');
 
     // 3. Prepare run execution metadata
@@ -1248,7 +1263,24 @@ export class WorkflowPlayer {
         }
         assertTargetOrigin(session.page.url(), versionObj.target.origin, 'successCriteria');
 
-        const criteriaResult = await evaluateSuccessCriteria(session, versionObj.successCriteria);
+        // Resolve parameter-bound criteria locally. Unresolvable references
+        // (missing/empty/non-string input) fail closed; error details name
+        // inputs only, never their values.
+        const { criteria: resolvedCriteria, unresolved: unresolvedRefs } = resolveSuccessCriteria(
+          versionObj.successCriteria,
+          inputs
+        );
+        const criteriaResult =
+          unresolvedRefs.length > 0
+            ? {
+                passed: false,
+                finalPathMatched: null,
+                pageTitleMatched: null,
+                textPresentFound: null,
+                textAbsentFound: null,
+                details: `Success criteria could not be resolved from runtime inputs: ${unresolvedRefs.join(', ')}.`,
+              }
+            : await evaluateSuccessCriteria(session, resolvedCriteria);
         assertTargetOrigin(session.page.url(), versionObj.target.origin, 'successCriteriaFinal');
         runResult.successCriteriaResult = criteriaResult;
         if (!criteriaResult.passed) {
