@@ -176,6 +176,9 @@ node scripts/super-memory.js <command> [workflowId] [options]
 | `promote <id>` | Explicitly promotes a verified draft to active status after confirmation. | `node scripts/super-memory.js promote wf_checkout` |
 | `play <id>` | Executes the active verified version (ordinary playback). | `node scripts/super-memory.js play wf_checkout --inputs inputs.json` |
 | `repair <id>` | Detects failure on active version, queries Meta model, and branches an unapproved draft. | `node scripts/super-memory.js repair wf_checkout --inputs inputs.json` |
+| `discover <task>` | Looks up a reusable verified workflow; on a miss, runs a grounded discovery session and saves an unapproved draft. | `node scripts/super-memory.js discover --intent intent.json -w ./workflows` |
+
+Use `--workflows-dir, -w <path>` to select the workflow repository (default: `./workflows`). For deterministic offline work, prefer a structured intent file (`--intent`). Plain-language discovery requires a real model provider and an explicit `--origin`; it never invents a target origin. `repair` accepts `--retries <n>` to control provider retry attempts (`0` disables retries; default `1`).
 
 ### 3. Safe Runtime Inputs
 
@@ -216,6 +219,61 @@ Promotion requires intentional operator confirmation:
 
 ---
 
+## Workflow Discovery, Lookup and Reuse
+
+`discover` first checks whether a verified workflow can be reused; it only starts a model-driven discovery session on a lookup miss. Lookup is deliberately conservative: exact origin and start path, compatible declared inputs, compatible success criteria, and at least two shared meaningful objective words are all required. Multiple survivors are reported as ambiguous and nothing is executed. A false negative (an unnecessary discovery) is preferred over executing the wrong workflow.
+
+During discovery, the model observes bounded, sanitized page snapshots and proposes one grounded action at a time. Raw page evidence is used only inside the local runtime to verify success conditions; model requests, journals, and diagnostics receive redacted data only, and parameter values are treated as secrets throughout.
+
+Discovered workflows are saved as **unapproved drafts**. They follow the same lifecycle as repairs: `review` (read-only diff), `trial` (genuine browser trial producing hash-bound evidence), and `promote` with explicit confirmation. Discovery never promotes its own candidate.
+
+### Parameter-bound success criteria (`schemaVersion 1.1.0`)
+
+A workflow can verify the actual requested runtime value instead of a baked-in literal. Under `schemaVersion: "1.1.0"`, the `pageTitle`, `textPresent`, and `textAbsent` criteria may reference a declared input:
+
+```json
+{
+  "schemaVersion": "1.1.0",
+  "inputs": [
+    { "name": "search_item", "type": "string", "label": "Search Item", "required": true }
+  ],
+  "successCriteria": {
+    "finalPath": "/cart",
+    "textPresent": { "input": "search_item" }
+  }
+}
+```
+
+References are validated everywhere they can appear (task intent, workflow schema, candidate construction, playback), resolved only locally, and fail a preflight check before any browser launches if a referenced input is missing or empty. `finalPath` and step-level verifications remain literal-only. Existing `1.0.0` workflows are unchanged. See `docs/architecture/parameter-bound-success-criteria.md` for the full design.
+
+When an intent and a separate `--inputs` file are both supplied, their values are reconciled once: conflicting, undeclared, or non-string values are rejected with an error that names the input, never its value.
+
+## Local Fixtures
+
+Two deterministic local websites are included for development and testing. Both bind to loopback only and keep state in memory.
+
+| Fixture | Command | Origin | Flow |
+| :--- | :--- | :--- | :--- |
+| SuperStore (shopping) | `npm run fixture` | `http://127.0.0.1:8080` | `/store` → `/cart` → `/checkout` → `/receipt` |
+| City Books (bookstore) | `npm run fixture:bookstore` | `http://127.0.0.1:8081` | `/catalog` → `/results` → `/basket` |
+
+Stop either server with Ctrl+C. The bookstore server supports controlled website-drift variants for repair experiments via environment variables (`BOOKSTORE_FIND_BUTTON`, `BOOKSTORE_TITLE_LABEL`, `BOOKSTORE_HIDE_FIND_BUTTON=1`, `BOOKSTORE_EXTRA_BUTTON`, `BOOKSTORE_STRUCTURAL_VARIANT=1`, `BOOKSTORE_BASKET_SUMMARY_ONLY=1`); with none set it serves the baseline site.
+
+## Capability Status
+
+| Capability | Status |
+| :--- | :--- |
+| Verified playback, lookup and reuse on local fixtures | Validated by automated tests and controlled local experiments |
+| Parameter-bound verification (v1.1.0) with preflight | Validated by automated tests |
+| Discovery with mock providers (offline) | Validated by automated tests and the offline demo |
+| Discovery and repair with live Meta inference | Demonstrated in single controlled local experiments; not a reliability benchmark |
+| Repair proposals | Grounded against the observed page snapshot; ungrounded proposals are rejected before any draft is created |
+| Arbitrary public websites, real accounts, payments | **Not supported.** Local-first, loopback-oriented, operator-supervised |
+
+Super Memory is an engineering prototype under active development. It is not production-ready and makes no claim of supporting arbitrary websites.
+
+---
+
 ## Complete Recovery Demonstration (`scripts/demo-recovery.js`)
 
 Super Memory provides an automated, reproducible end-to-end demonstration runner that spins up an isolated temporary repository and a local HTTP website fixture, executes the complete recovery lifecycle, and verifies all safety invariants:
@@ -252,3 +310,6 @@ node --env-file=.env scripts/demo-recovery.js --no-headless
 2. **Loopback Protection:** Localhost and loopback destinations (`127.0.0.1`, `::1`, `localhost`) are blocked by default and require `--allow-localhost`.
 3. **No Direct Model Code Execution:** LLMs generate structured repair proposals adhering to strict JSON schemas (`role`, `name`, `label`); arbitrary JavaScript evaluation or shell execution is prohibited.
 4. **Offline Test Suite:** The default test suite (`npm test`) runs 100% offline using hermetic mock providers and local HTTP servers with zero inference credits spent.
+5. **Grounded Repairs:** A repair proposal is rejected before any draft is created unless its exact target (role and accessible name, or field label) was observed, enabled, on the workflow's own target origin in the failure snapshot. Page-text substrings never count as grounding.
+6. **Preflight Verification Inputs:** Every input referenced by a workflow's success criteria must be supplied with a usable value before any browser session launches, in both playback and discovery.
+7. **Known Limitations:** Trial evidence is hash-bound but unsigned and trusted within the local-operator model. Lookup is intentionally conservative and misses some paraphrased tasks. Criteria-only website changes (steps fine, success criteria broken) cannot be repaired automatically and fail safely. Partial-DOM observability, cross-origin subresources, and DNS rebinding remain documented residual risks from the security reviews.
