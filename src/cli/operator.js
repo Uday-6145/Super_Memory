@@ -23,6 +23,7 @@
 
 import http from 'node:http';
 import fs from 'node:fs/promises';
+import os from 'node:os';
 import path from 'node:path';
 import readline from 'node:readline/promises';
 import { parseArgs } from 'node:util';
@@ -137,6 +138,27 @@ export async function loadInputs(inputsPath) {
   }
 
   return parsed;
+}
+
+/**
+ * Collects known sensitive values for output redaction from runtime input
+ * objects and explicit secret lists. Only non-empty strings are collected.
+ *
+ * @param {...(object|Array)} sources - Input objects (values used) or secret arrays
+ * @returns {string[]}
+ */
+export function deriveSecrets(...sources) {
+  const out = [];
+  for (const source of sources) {
+    if (!source) continue;
+    const values = Array.isArray(source) ? source : Object.values(source);
+    for (const value of values) {
+      if (typeof value === 'string' && value.trim().length > 0) {
+        out.push(value);
+      }
+    }
+  }
+  return out;
 }
 
 /**
@@ -414,10 +436,20 @@ export class OperatorCLI {
 
   /**
    * Capability B: Inspect a workflow
+   *
+   * Workflow-authored content is redacted against supplied runtime inputs so a
+   * coincidental secret value in a description or parameter cannot leak.
    */
-  async inspect(workflowId) {
+  async inspect(workflowId, { inputsPath, inputs: directInputs, secrets: customSecrets = [] } = {}) {
     if (!workflowId) {
       throw new WorkflowError('Missing workflow ID for inspect command.');
+    }
+
+    let secrets = deriveSecrets(customSecrets, directInputs);
+    if (!directInputs && inputsPath) {
+      try {
+        secrets = [...secrets, ...deriveSecrets(await loadInputs(inputsPath))];
+      } catch {}
     }
 
     const manifest = await this.repo.getManifest(workflowId);
@@ -425,11 +457,14 @@ export class OperatorCLI {
       throw new WorkflowNotFoundError(`Workflow "${workflowId}" not found in repository.`, { workflowId });
     }
 
+    const stepLine = (step) =>
+      `    Step ${step.order}: ${step.action} [${redactSecrets(step.id || '', secrets)}] ${formatStepParams(step.params, secrets)}${step.description ? ` (${redactSecrets(step.description, secrets)})` : ''}`;
+
     this.write('================================================================================');
     this.write(`WORKFLOW: ${manifest.id}`);
     this.write('================================================================================');
-    this.write(`Name:         ${manifest.name}`);
-    this.write(`Description:  ${manifest.description}`);
+    this.write(`Name:         ${redactSecrets(manifest.name || '', secrets)}`);
+    this.write(`Description:  ${redactSecrets(manifest.description || '', secrets)}`);
     this.write(`Status:       ${manifest.enabled ? 'ENABLED' : 'DISABLED'}`);
     this.write(`Created:      ${manifest.timestamps?.createdAt || 'unknown'}`);
     this.write(`Updated:      ${manifest.timestamps?.updatedAt || 'unknown'}`);
@@ -441,12 +476,12 @@ export class OperatorCLI {
         const hash = calculateContentHash(activeVer);
         this.write(`\n[Active Version: v${activeVer.version} (verified)]`);
         this.write(`  Content Hash:    ${hash}`);
-        this.write(`  Target:          ${activeVer.target?.origin || ''}${activeVer.target?.startPath || ''}`);
+        this.write(`  Target:          ${redactSecrets(activeVer.target?.origin || '', secrets)}${redactSecrets(activeVer.target?.startPath || '', secrets)}`);
         this.write(`  Total Steps:     ${activeVer.steps?.length || 0}`);
         for (const step of activeVer.steps || []) {
-          this.write(`    Step ${step.order}: ${step.action} [${step.id}] ${formatStepParams(step.params)}`);
+          this.write(stepLine(step));
         }
-        this.write(`  Success Criteria: ${JSON.stringify(activeVer.successCriteria || {})}`);
+        this.write(`  Success Criteria: ${redactSecrets(JSON.stringify(activeVer.successCriteria || {}), secrets)}`);
 
         // Evidence details
         const evidence = await this.repo.getVerificationEvidence(workflowId, activeVer.version);
@@ -470,12 +505,12 @@ export class OperatorCLI {
         this.write(`\n[Draft Version: v${draftVer.version} (unapproved draft)] <-- PENDING OPERATOR REVIEW`);
         this.write(`  Parent Version:  ${draftVer.parentVersion ? `v${draftVer.parentVersion}` : 'none'}`);
         this.write(`  Content Hash:    ${draftHash}`);
-        this.write(`  Change Summary:  ${draftVer.changeSummary || '(no summary)'}`);
+        this.write(`  Change Summary:  ${redactSecrets(draftVer.changeSummary || '(no summary)', secrets)}`);
         this.write(`  Total Steps:     ${draftVer.steps?.length || 0}`);
         for (const step of draftVer.steps || []) {
-          this.write(`    Step ${step.order}: ${step.action} [${step.id}] ${formatStepParams(step.params)}`);
+          this.write(stepLine(step));
         }
-        this.write(`  Success Criteria: ${JSON.stringify(draftVer.successCriteria || {})}`);
+        this.write(`  Success Criteria: ${redactSecrets(JSON.stringify(draftVer.successCriteria || {}), secrets)}`);
       }
     } else {
       this.write('\n[Draft Version: None]');
@@ -489,7 +524,7 @@ export class OperatorCLI {
       this.write('\n[Declared Inputs]');
       for (const input of refVersion.inputs) {
         const reqStr = input.required ? 'required' : 'optional';
-        this.write(`  - ${input.name} (${input.type}, ${reqStr}): ${input.description || ''}`);
+        this.write(`  - ${input.name} (${input.type}, ${reqStr}): ${redactSecrets(input.description || '', secrets)}`);
       }
     } else {
       this.write('\n[Declared Inputs: None]');
@@ -529,15 +564,10 @@ export class OperatorCLI {
       ? await this.repo.getVersion(workflowId, manifest.activeVersion)
       : null;
 
-    let secrets = [...customSecrets];
-    if (directInputs && typeof directInputs === 'object') {
-      const extracted = Object.values(directInputs).filter((v) => typeof v === 'string' && v.trim().length > 0);
-      secrets = [...secrets, ...extracted];
-    } else if (inputsPath) {
+    let secrets = deriveSecrets(customSecrets, directInputs);
+    if (!directInputs && inputsPath) {
       try {
-        const loaded = await loadInputs(inputsPath);
-        const extracted = Object.values(loaded).filter((v) => typeof v === 'string' && v.trim().length > 0);
-        secrets = [...secrets, ...extracted];
+        secrets = [...secrets, ...deriveSecrets(await loadInputs(inputsPath))];
       } catch {}
     }
 
@@ -572,7 +602,7 @@ export class OperatorCLI {
     }
 
     const inputs = directInputs || (await loadInputs(inputsPath));
-    const secrets = Object.values(inputs).filter((v) => typeof v === 'string' && v.trim().length > 0);
+    const secrets = deriveSecrets(inputs);
 
     // Validate inputs against draft declarations early
     validateRuntimeInputs(draftVersion.inputs || [], inputs, workflowId);
@@ -746,15 +776,10 @@ export class OperatorCLI {
       }
     }
 
-    let secrets = [...customSecrets];
-    if (directInputs && typeof directInputs === 'object') {
-      const extracted = Object.values(directInputs).filter((v) => typeof v === 'string' && v.trim().length > 0);
-      secrets = [...secrets, ...extracted];
-    } else if (inputsPath) {
+    let secrets = deriveSecrets(customSecrets, directInputs);
+    if (!directInputs && inputsPath) {
       try {
-        const loaded = await loadInputs(inputsPath);
-        const extracted = Object.values(loaded).filter((v) => typeof v === 'string' && v.trim().length > 0);
-        secrets = [...secrets, ...extracted];
+        secrets = [...secrets, ...deriveSecrets(await loadInputs(inputsPath))];
       } catch {}
     }
 
@@ -838,6 +863,7 @@ export class OperatorCLI {
     }
 
     const inputs = directInputs || (await loadInputs(inputsPath));
+    const secrets = deriveSecrets(inputs);
     const isLocalhostAllowed = allowLocalhost ?? this.allowLocalhost;
     const isHeadless = headless ?? this.headless;
 
@@ -865,7 +891,7 @@ export class OperatorCLI {
       if (result.ok) {
         this.write(`Playback succeeded! Active version v${result.version} finished in ${result.durationMs}ms.`);
       } else {
-        this.write(`Playback failed: active version v${result.version} encountered an error: ${result.error}`);
+        this.write(`Playback failed: active version v${result.version} encountered an error: ${redactSecrets(result.error, secrets)}`);
       }
       return result;
     } finally {
@@ -897,7 +923,7 @@ export class OperatorCLI {
 
     const activeVersion = await this.repo.getVersion(workflowId, manifest.activeVersion);
     const inputs = directInputs || (await loadInputs(inputsPath));
-    const secrets = Object.values(inputs).filter((v) => typeof v === 'string' && v.trim().length > 0);
+    const secrets = deriveSecrets(inputs);
 
     const isLocalhostAllowed = allowLocalhost ?? this.allowLocalhost;
     const isHeadless = headless ?? this.headless;
@@ -925,7 +951,7 @@ export class OperatorCLI {
       return { repaired: false, reason: 'active_passed' };
     }
 
-    this.write(`Active version playback failed: ${runResult.error}`);
+    this.write(`Active version playback failed: ${redactSecrets(runResult.error, secrets)}`);
     this.write('Collecting failure diagnostics and DOM snapshot...');
 
     const failedStep = activeVersion.steps?.find((s) => s.id === runResult.failedStepId) || null;
@@ -1016,7 +1042,7 @@ export class OperatorCLI {
     const proposalResult = await generateRepairProposal(modelProvider, diagnostic, activeVersion);
     const proposal = proposalResult.proposal;
 
-    this.write(`Proposal received for step "${proposal.stepId}": ${proposal.suspectedCause}`);
+    this.write(`Proposal received for step "${proposal.stepId}": ${redactSecrets(proposal.suspectedCause, secrets)}`);
     this.write('Applying proposal to create unapproved draft version...');
 
     const draft = await applyRepairToDraft(this.repo, proposal, {
@@ -1047,6 +1073,7 @@ export class OperatorCLI {
    * @param {boolean} [options.allowLocalhost]
    * @param {boolean} [options.headless]
    * @param {Function} [options.approveAction] - Explicit approval callback for consequential discovery actions
+   * @param {string|null} [options.journalDir] - Scratch directory for the discovery session journal (default: system temp dir; null disables)
    * @returns {Promise<object>}
    */
   async discover(taskIntentOrObjective, {
@@ -1060,6 +1087,7 @@ export class OperatorCLI {
     allowLocalhost,
     headless,
     approveAction,
+    journalDir = path.join(os.tmpdir(), 'super-memory-discovery-journal'),
   } = {}) {
     let intent;
     if (intentPath) {
@@ -1143,8 +1171,9 @@ export class OperatorCLI {
     const match = await findMatchingWorkflow(this.repo, intent);
 
     if (match.ambiguous) {
+      const lookupSecrets = deriveSecrets((intent.parameters || []).map((p) => p.value));
       this.writeErr(
-        `Ambiguous workflow lookup: ${match.candidates.length} verified workflows match "${intent.objective}". ` +
+        `Ambiguous workflow lookup: ${match.candidates.length} verified workflows match "${redactSecrets(intent.objective || '', lookupSecrets)}". ` +
           `Refine the objective, parameters, or success conditions instead of running an uncertain workflow.`
       );
       return {
@@ -1271,6 +1300,7 @@ export class OperatorCLI {
         modelProvider,
         allowLocalhost: isLocalhostAllowed,
         approveAction,
+        journalDir,
         onEvent: (ev) => {
           if (ev.event === 'observe') {
             this.write(`  [Step ${ev.stepIndex + 1}] Observing ${ev.url} (${ev.elementsCount} elements)`);
@@ -1284,11 +1314,15 @@ export class OperatorCLI {
 
       if (discoveryRes.status !== 'SUCCESS') {
         this.writeErr(`Discovery failed: ${discoveryRes.status} (${discoveryRes.reason || 'unverifiable'})`);
+        if (orchestrator.lastJournalPath) {
+          this.writeErr(`Scratch journal retained at: ${orchestrator.lastJournalPath} (diagnostic only; never auto-resumed)`);
+        }
         return {
           action: 'failed',
           status: discoveryRes.status,
           reason: discoveryRes.reason,
           trace: discoveryRes.trace,
+          journalPath: orchestrator.lastJournalPath,
         };
       }
 
@@ -1381,7 +1415,7 @@ export class OperatorCLI {
             this.writeErr('Error: Missing required argument <workflowId> for "inspect".');
             return 1;
           }
-          await this.inspect(targetId);
+          await this.inspect(targetId, { inputsPath: values.inputs });
           return 0;
 
         case 'review':

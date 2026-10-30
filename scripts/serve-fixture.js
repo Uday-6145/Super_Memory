@@ -14,7 +14,61 @@ import http from 'node:http';
 import path from 'node:path';
 import { parseArgs } from 'node:util';
 
+const FIXTURE_PRODUCTS = ['Paneer Toast', 'Fresh Paneer Pizza', 'Crispy Tofu Burger'];
+
+function escapeHtml(value) {
+  return String(value)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
+function normalizeProductQuery(value) {
+  return String(value || '')
+    .trim()
+    .replace(/\s+/g, ' ')
+    .toLowerCase();
+}
+
+function findFixtureProduct(search) {
+  const normalizedSearch = normalizeProductQuery(search);
+  if (!normalizedSearch) {
+    return null;
+  }
+  return (
+    FIXTURE_PRODUCTS.find((product) => normalizeProductQuery(product) === normalizedSearch) || null
+  );
+}
+
 export function createFixtureServer() {
+  // Process-local synthetic cart. It deliberately derives its contents only
+  // from products validated against the fixture catalog below.
+  const cartItems = [];
+
+  const renderCart = (res, { statusCode = 200, notice = '', invalidSubmission = false } = {}) => {
+    const itemsHtml = cartItems
+      .map((product) => `    <li class="cart-item">${escapeHtml(product)}</li>`)
+      .join('\n');
+    const cartContents =
+      cartItems.length > 0
+        ? `  <ul class="cart-items">\n${itemsHtml}\n  </ul>`
+        : '  <p>Your cart is empty.</p>';
+    const checkoutHtml =
+      cartItems.length > 0 ? '\n  <p><a href="/checkout" role="link">Proceed to Checkout</a></p>' : '';
+
+    res.writeHead(statusCode, { 'Content-Type': 'text/html; charset=utf-8' });
+    res.end(`<!DOCTYPE html>
+<html>
+<head><title>Shopping Cart</title></head>
+<body>
+  <h1>Your Cart</h1>
+${notice ? `  <p${invalidSubmission ? ' role="alert"' : ''}>${escapeHtml(notice)}</p>\n` : ''}${cartContents}${checkoutHtml}
+</body>
+</html>`);
+  };
+
   return http.createServer((req, res) => {
     const parsed = new URL(req.url, `http://${req.headers.host}`);
 
@@ -33,16 +87,25 @@ export function createFixtureServer() {
 </body>
 </html>`);
     } else if (parsed.pathname === '/cart') {
-      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
-      res.end(`<!DOCTYPE html>
-<html>
-<head><title>Shopping Cart</title></head>
-<body>
-  <h1>Your Cart</h1>
-  <p>Item added to cart.</p>
-  <p><a href="/checkout" role="link">Proceed to Checkout</a></p>
-</body>
-</html>`);
+      if (!parsed.searchParams.has('search')) {
+        renderCart(res);
+        return;
+      }
+
+      const product = findFixtureProduct(parsed.searchParams.get('search'));
+      if (!product) {
+        renderCart(res, {
+          statusCode: 400,
+          notice: 'No product was added. Choose a product from the catalog.',
+          invalidSubmission: true,
+        });
+        return;
+      }
+
+      if (!cartItems.includes(product)) {
+        cartItems.push(product);
+      }
+      renderCart(res, { notice: `Item added to cart: ${product}` });
     } else if (parsed.pathname === '/checkout') {
       res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
       res.end(`<!DOCTYPE html>

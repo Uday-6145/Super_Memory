@@ -4,6 +4,7 @@
 
 export * from './task-intent.js';
 export * from './nl-intent.js';
+export * from './session-journal.js';
 export * from './decision.js';
 export * from './candidate.js';
 export * from './lookup.js';

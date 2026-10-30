@@ -18,6 +18,7 @@ import { WorkflowError } from '../workflow/errors.js';
 import { redactSecrets, sanitizeSnapshot } from '../workflow/diagnostics.js';
 import { buildDecisionPrompt, parseDecisionResponse, validateActionDecision } from './decision.js';
 import { buildCandidateFromTrace } from './candidate.js';
+import { DiscoverySessionJournal } from './session-journal.js';
 
 export class DiscoverySessionError extends WorkflowError {
   constructor(message, details = {}) {
@@ -38,6 +39,31 @@ const CONSEQUENTIAL_TEXT_PATTERNS = [
   /remove/i,
 ];
 
+// Ambiguous forward-progression controls. Harmless on ordinary pages, but on
+// checkout, payment, billing, order-review, or confirmation surfaces they are
+// frequently the control that submits, pays, or finalizes. Never treat them
+// as self-evidently safe.
+const AMBIGUOUS_PROGRESSION_PATTERNS = [
+  /\bcontinue\b/i,
+  /\bnext\b/i,
+  /\bproceed\b/i,
+  /\bconfirm\b/i,
+  /\bfinish\b/i,
+];
+
+// Page surfaces where an ambiguous control must be treated as consequential.
+// Matched against URL pathname and page title only (never full page text, so
+// incidental body copy cannot widen the policy).
+const SENSITIVE_PAGE_PATTERNS = [
+  /checkout/i,
+  /payment/i,
+  /billing/i,
+  /\border\b/i,
+  /review/i,
+  /confirm/i,
+  /\bpay\b/i,
+];
+
 function getActionTargetText(decision, observedElement) {
   const parts = [
     decision?.name,
@@ -49,7 +75,15 @@ function getActionTargetText(decision, observedElement) {
   return parts.filter((part) => typeof part === 'string' && part.trim() !== '').join(' | ');
 }
 
-function actionRequiresApproval(decision, observedElement, intent) {
+function getPageContextText(observation) {
+  let pathname = '';
+  try {
+    pathname = new URL(observation?.url || '').pathname;
+  } catch {}
+  return `${pathname} | ${observation?.title || ''}`;
+}
+
+function actionRequiresApproval(decision, observedElement, intent, observation) {
   const targetText = getActionTargetText(decision, observedElement);
   const normalizedTarget = targetText.toLowerCase();
 
@@ -62,6 +96,27 @@ function actionRequiresApproval(decision, observedElement, intent) {
   const matchedPattern = CONSEQUENTIAL_TEXT_PATTERNS.find((pattern) => pattern.test(targetText));
   if (matchedPattern) {
     return { required: true, reason: `matches consequential-action pattern ${matchedPattern}` };
+  }
+
+  const ambiguousMatch = AMBIGUOUS_PROGRESSION_PATTERNS.find((pattern) => pattern.test(targetText));
+  if (ambiguousMatch) {
+    const pageContext = getPageContextText(observation);
+    const sensitivePage = SENSITIVE_PAGE_PATTERNS.find((pattern) => pattern.test(pageContext));
+    if (sensitivePage) {
+      return {
+        required: true,
+        reason: `ambiguous progression control (${ambiguousMatch}) on a sensitive page surface (${sensitivePage})`,
+      };
+    }
+    const declaredPolicy = [...(intent.approvalRequired || []), ...(intent.forbidden || [])].filter(
+      (term) => typeof term === 'string' && term.trim() !== ''
+    );
+    if (declaredPolicy.length > 0) {
+      return {
+        required: true,
+        reason: `ambiguous progression control (${ambiguousMatch}) while the task declares an approval/forbidden policy`,
+      };
+    }
   }
 
   return { required: false };
@@ -81,6 +136,7 @@ export class DiscoveryOrchestrator {
    * @param {number} [options.maxWallClockMs=300000] - Maximum discovery wall-clock duration
    * @param {number} [options.maxTotalTokens=60000] - Maximum cumulative model tokens
    * @param {Function} [options.now] - Injectable clock returning milliseconds, for tests
+   * @param {string|null} [options.journalDir] - Scratch directory for crash-safe session journaling (null disables)
    */
   constructor({
     browserRuntime,
@@ -94,6 +150,7 @@ export class DiscoveryOrchestrator {
     maxWallClockMs = 300000,
     maxTotalTokens = 60000,
     now = null,
+    journalDir = null,
   } = {}) {
     if (!browserRuntime) {
       throw new DiscoverySessionError('BrowserRuntime instance is required for DiscoveryOrchestrator.');
@@ -114,6 +171,7 @@ export class DiscoveryOrchestrator {
     this.maxTotalTokens = maxTotalTokens;
     this.clockNow = typeof now === 'function' ? now : () => performance.now();
     this.totalTokensUsed = 0;
+    this.journalDir = journalDir;
   }
 
   _wallClockExceeded(startTime) {
@@ -226,8 +284,39 @@ export class DiscoveryOrchestrator {
     let consecutiveInvalidDecisions = 0;
     let session = null;
     let state = 'INTAKE';
+    let lastJournalObservation = null;
+    // Loop variables are function-scoped so the finally journal handoff can read them.
+    let stepIndex = 0;
+    let lastActionKey = null;
+    let lastActionPageHash = null;
+    const attemptedConsequentialActions = new Set();
 
     this._emit('intake', { taskId: intent.taskId, objective: intent.objective });
+
+    // Crash-safe scratch journal (diagnostic only; never executed from).
+    let journal = null;
+    if (this.journalDir) {
+      try {
+        journal = new DiscoverySessionJournal({
+          journalDir: this.journalDir,
+          taskId: intent.taskId,
+          secrets,
+        });
+        await journal.checkpoint({
+          intent,
+          stepIndex: 0,
+          modelCallCount: 0,
+          totalTokensUsed: 0,
+          lastObservation: null,
+          attemptedConsequentialKeys: [],
+          reason: 'session started',
+        });
+      } catch (err) {
+        this._emit('journal_error', { message: err.message });
+        journal = null;
+      }
+    }
+    this.lastJournalPath = journal ? journal.journalPath : null;
 
     try {
       // 1. Launch BrowserSession
@@ -238,12 +327,6 @@ export class DiscoveryOrchestrator {
       // 2. Navigate to initial target origin + startPath
       const initialUrl = `${intent.targetOrigin}${intent.startPath}`;
       await session.navigate(initialUrl);
-
-      // Loop variables
-      let stepIndex = 0;
-      let lastActionKey = null;
-      let lastActionPageHash = null;
-      const attemptedConsequentialActions = new Set();
 
       while (stepIndex < this.maxSteps) {
         if (options.signal?.aborted) {
@@ -265,6 +348,7 @@ export class DiscoveryOrchestrator {
         state = 'OBSERVE';
         const rawSnapshot = await session.getSnapshot({ maxTextLength: 3000, maxElements: 40 });
         const observation = sanitizeSnapshot(rawSnapshot, secrets);
+        lastJournalObservation = observation;
         const currentObservationHash = `${observation.url}::${(observation.text || '').slice(0, 200)}::${(observation.elements || []).length}`;
 
         this._emit('observe', {
@@ -365,8 +449,17 @@ export class DiscoveryOrchestrator {
           state = 'VERIFY_OUTCOME';
           const outcome = this._evaluateSuccessConditions(intent, observation);
           if (outcome.passed) {
+            if (trace.length === 0) {
+              state = 'ABORTED_UNVERIFIABLE';
+              return {
+                status: 'ABORTED_UNVERIFIABLE',
+                reason: 'Outcome verified with no executed actions; an empty trace cannot produce a candidate workflow.',
+                trace,
+                eventsCount: trace.length,
+              };
+            }
             this._emit('verdict', { status: 'SUCCESS', details: outcome.details });
-            state = 'CONVERT';
+            state = 'SUCCESS';
             const { candidate, contentHash } = buildCandidateFromTrace({
               trace,
               intent,
@@ -408,7 +501,7 @@ export class DiscoveryOrchestrator {
 
         // Consequential-action approval: deterministic policy only, never model rationale.
         // Consequential actions are single-attempt: an uncertain outcome must not be retried blindly.
-        const approvalCheck = actionRequiresApproval(decision, observedElement, intent);
+        const approvalCheck = actionRequiresApproval(decision, observedElement, intent, observation);
         if (approvalCheck.required) {
           const consequentialKey = `${decision.action}:${decision.elementIndex ?? ''}:${getActionTargetText(decision, observedElement).toLowerCase()}`;
           if (attemptedConsequentialActions.has(consequentialKey)) {
@@ -561,10 +654,35 @@ export class DiscoveryOrchestrator {
         if (trace.length > 0) {
           trace[trace.length - 1].postObservation = postObservation;
         }
+        lastJournalObservation = postObservation;
+        if (journal) {
+          try {
+            await journal.checkpoint({
+              intent,
+              stepIndex,
+              modelCallCount,
+              totalTokensUsed: this.totalTokensUsed,
+              lastObservation: postObservation,
+              attemptedConsequentialKeys: [...attemptedConsequentialActions],
+              reason: `completed step ${stepIndex}`,
+            });
+          } catch (err) {
+            this._emit('journal_error', { message: err.message });
+          }
+        }
         const autoOutcome = this._evaluateSuccessConditions(intent, postObservation);
 
         if (autoOutcome.passed) {
-          state = 'CONVERT';
+          if (trace.length === 0) {
+            state = 'ABORTED_UNVERIFIABLE';
+            return {
+              status: 'ABORTED_UNVERIFIABLE',
+              reason: 'Outcome verified with no executed actions; an empty trace cannot produce a candidate workflow.',
+              trace,
+              eventsCount: trace.length,
+            };
+          }
+          state = 'SUCCESS';
           this._emit('verdict', { status: 'SUCCESS', details: autoOutcome.details });
           const { candidate, contentHash } = buildCandidateFromTrace({
             trace,
@@ -590,6 +708,41 @@ export class DiscoveryOrchestrator {
         eventsCount: trace.length,
       };
     } finally {
+      if (journal) {
+        try {
+          if (state === 'SUCCESS') {
+            // The completed candidate lives in the workflow repository; scratch is deleted.
+            await journal.discard();
+          } else if (
+            state === 'CANCELLED' ||
+            state === 'APPROVAL_REQUIRED' ||
+            state.startsWith('ABORTED')
+          ) {
+            await journal.finalize(state, {
+              intent,
+              stepIndex,
+              modelCallCount,
+              totalTokensUsed: this.totalTokensUsed,
+              lastObservation: lastJournalObservation,
+              attemptedConsequentialKeys: [...attemptedConsequentialActions],
+              reason: `terminal state ${state}`,
+            });
+          } else {
+            // Interrupted mid-state (exception or crash path): leave an in-progress marker.
+            await journal.checkpoint({
+              intent,
+              stepIndex,
+              modelCallCount,
+              totalTokensUsed: this.totalTokensUsed,
+              lastObservation: lastJournalObservation,
+              attemptedConsequentialKeys: [...attemptedConsequentialActions],
+              reason: `interrupted during ${state}`,
+            });
+          }
+        } catch (err) {
+          this._emit('journal_error', { message: err.message });
+        }
+      }
       if (session) {
         await session.close().catch(() => {});
       }
