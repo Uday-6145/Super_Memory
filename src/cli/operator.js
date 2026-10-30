@@ -62,6 +62,7 @@ import {
   getHomePaths,
   HOME_ENV_VAR,
 } from '../config/home.js';
+import { appendAuditEvent } from '../config/audit.js';
 
 /**
  * Returns the default staging path for trial verification evidence.
@@ -473,6 +474,18 @@ export class OperatorCLI {
       typeof this.repo?.baseDir === 'string' &&
       path.resolve(this.repo.baseDir) === this.homePaths.workflows
     );
+  }
+
+  /**
+   * Appends a privacy-safe audit event for managed-memory operations.
+   * Only allow-listed fields are recorded; audit failures never break the
+   * operation they describe.
+   */
+  async _audit(event, { managedOnly = true } = {}) {
+    if (managedOnly && !this._isManagedRepository()) return;
+    try {
+      await appendAuditEvent(this.homePaths.audit, event);
+    } catch {}
   }
 
   write(msg = '') {
@@ -914,6 +927,12 @@ export class OperatorCLI {
 
     // Atomic promotion through validated repository lifecycle
     const promotionResult = await this.repo.markVerified(workflowId, draftVersion.version, evidence);
+    await this._audit({
+      type: 'promotion',
+      workflowId,
+      version: draftVersion.version,
+      contentHash: evidence.contentHash,
+    });
 
     // Clean up staged evidence file if it exists
     if (evidenceSourcePath) {
