@@ -55,6 +55,13 @@ import {
   DiscoveryOrchestrator,
   parseNaturalLanguageTask,
 } from '../discovery/index.js';
+import {
+  resolveWorkflowsDir,
+  detectLegacyWorkflowsDir,
+  ensureSuperMemoryHome,
+  getHomePaths,
+  HOME_ENV_VAR,
+} from '../config/home.js';
 
 /**
  * Returns the default staging path for trial verification evidence.
@@ -432,14 +439,23 @@ export class OperatorCLI {
    */
   constructor({
     repository,
-    workflowsDir = process.env.WORKFLOWS_DIR || './workflows',
+    workflowsDir,
+    homeDir,
     browserRuntime,
     modelProvider,
     allowLocalhost = false,
     headless = true,
     io = {},
   } = {}) {
-    this.workflowsDir = path.resolve(workflowsDir);
+    // Repository resolution: explicit -w/argument wins, then WORKFLOWS_DIR,
+    // then the managed Super Memory home repository. homeDir (or the
+    // SUPER_MEMORY_HOME env var) redirects the managed home, e.g. in tests.
+    const env = homeDir ? { ...process.env, [HOME_ENV_VAR]: homeDir } : process.env;
+    const resolved = resolveWorkflowsDir({ explicit: workflowsDir, env });
+    this.homeDir = resolved.home;
+    this.homePaths = getHomePaths(resolved.home);
+    this.workflowsDirSource = resolved.source;
+    this.workflowsDir = resolved.workflowsDir;
     this.repo = repository || new FileSystemWorkflowRepository({ baseDir: this.workflowsDir });
     this.browserRuntime = browserRuntime;
     this.modelProvider = modelProvider;
@@ -449,6 +465,14 @@ export class OperatorCLI {
     this.stdin = io.stdin || process.stdin;
     this.stdout = io.stdout || process.stdout;
     this.stderr = io.stderr || process.stderr;
+  }
+
+  /** True when the active repository is the managed home repository. */
+  _isManagedRepository() {
+    return (
+      typeof this.repo?.baseDir === 'string' &&
+      path.resolve(this.repo.baseDir) === this.homePaths.workflows
+    );
   }
 
   write(msg = '') {
@@ -1135,7 +1159,7 @@ export class OperatorCLI {
    * @param {boolean} [options.allowLocalhost]
    * @param {boolean} [options.headless]
    * @param {Function} [options.approveAction] - Explicit approval callback for consequential discovery actions
-   * @param {string|null} [options.journalDir] - Scratch directory for the discovery session journal (default: system temp dir; null disables)
+   * @param {string|null} [options.journalDir] - Scratch directory for the discovery session journal (default: managed home journals/; null disables)
    * @returns {Promise<object>}
    */
   async discover(taskIntentOrObjective, {
@@ -1149,8 +1173,18 @@ export class OperatorCLI {
     allowLocalhost,
     headless,
     approveAction,
-    journalDir = path.join(os.tmpdir(), 'super-memory-discovery-journal'),
+    journalDir,
   } = {}) {
+    // Default discovery journals live in the managed home when operating on
+    // the managed repository; scratch-repository runs keep the historical
+    // system-temp scratch location. An explicit journalDir (including null
+    // to disable) always wins. The journal creates its directory lazily.
+    const effectiveJournalDir =
+      journalDir === undefined
+        ? this._isManagedRepository()
+          ? this.homePaths.journals
+          : path.join(os.tmpdir(), 'super-memory-discovery-journal')
+        : journalDir;
     let intent;
     let preloadedInputs;
     if (intentPath) {
@@ -1374,7 +1408,7 @@ export class OperatorCLI {
         modelProvider,
         allowLocalhost: isLocalhostAllowed,
         approveAction,
-        journalDir,
+        journalDir: effectiveJournalDir,
         onEvent: (ev) => {
           if (ev.event === 'observe') {
             this.write(`  [Step ${ev.stepIndex + 1}] Observing ${ev.url} (${ev.elementsCount} elements)`);
@@ -1473,7 +1507,17 @@ export class OperatorCLI {
 
     if (values['workflows-dir']) {
       this.workflowsDir = path.resolve(values['workflows-dir']);
+      this.workflowsDirSource = 'explicit';
       this.repo = new FileSystemWorkflowRepository({ baseDir: this.workflowsDir });
+    } else if (this.workflowsDirSource === 'home') {
+      // Never silently hide a pre-existing ./workflows repository: warn with
+      // explicit migration guidance. Nothing is imported automatically.
+      try {
+        const legacy = await detectLegacyWorkflowsDir({ home: this.homeDir });
+        if (legacy) {
+          this.writeErr(`Warning: ${legacy.message}`);
+        }
+      } catch {}
     }
 
     const command = positionals[0];
@@ -1595,7 +1639,7 @@ Commands:
                               (plain text needs --origin and a real model provider; --intent is offline-safe)
 
 Options:
-  --workflows-dir, -w <path>    Workflow repository root directory (default: ./workflows)
+  --workflows-dir, -w <path>    Workflow repository root directory (default: managed home, SUPER_MEMORY_HOME)
   --inputs, -i <path>           JSON file containing workflow runtime inputs
   --intent <path>               Path to TaskIntent JSON file (for discover)
   --origin <url>                Target origin URL (for discover)
