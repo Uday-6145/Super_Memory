@@ -63,6 +63,7 @@ import {
   HOME_ENV_VAR,
 } from '../config/home.js';
 import { appendAuditEvent } from '../config/audit.js';
+import { scanRepositoryIntegrity } from '../workflow/integrity.js';
 
 /**
  * Returns the default staging path for trial verification evidence.
@@ -957,6 +958,32 @@ export class OperatorCLI {
   /**
    * Helper: Play active verified version (ordinary playback)
    */
+  /**
+   * Runs a read-only integrity scan over the active repository.
+   */
+  async integrityScan() {
+    const report = await scanRepositoryIntegrity(this.repo.baseDir);
+    if (report.totals.workflows === 0) {
+      this.write(`Integrity scan: repository at "${report.baseDir}" is empty.`);
+      return report;
+    }
+    for (const workflow of report.workflows) {
+      if (workflow.ok) {
+        this.write(`  OK: ${workflow.id}`);
+      } else {
+        for (const issue of workflow.issues) {
+          this.write(`  [${issue.code}] ${workflow.id}: ${issue.message}`);
+        }
+      }
+    }
+    this.write(
+      report.ok
+        ? `Integrity scan passed: ${report.totals.workflows} workflow(s), ${report.totals.versions} version(s), no issues.`
+        : `Integrity scan found ${report.totals.issues} issue(s) across ${report.totals.workflows} workflow(s). The repository was not modified.`
+    );
+    return report;
+  }
+
   async play(workflowId, { inputsPath, inputs: directInputs, allowLocalhost, headless } = {}) {
     if (!workflowId) {
       throw new WorkflowError('Missing workflow ID for play command.');
@@ -1549,6 +1576,10 @@ export class OperatorCLI {
           await this.list({ enabledOnly: Boolean(values['enabled-only']) });
           return 0;
 
+        case 'integrity':
+        case 'verify':
+          return (await this.integrityScan()).ok ? 0 : 1;
+
         case 'inspect':
           if (!targetId) {
             this.writeErr('Error: Missing required argument <workflowId> for "inspect".');
@@ -1656,6 +1687,7 @@ Commands:
   repair <workflowId>           Diagnose failure and generate unapproved repair draft via Meta model
   discover [taskOrIntent]       Discover and synthesize a new workflow or reuse matching workflow
                               (plain text needs --origin and a real model provider; --intent is offline-safe)
+  integrity                     Read-only integrity scan of the active repository
 
 Options:
   --workflows-dir, -w <path>    Workflow repository root directory (default: managed home, SUPER_MEMORY_HOME)

@@ -9,3 +9,4 @@ export * from './repository.js';
 export * from './player.js';
 export * from './diagnostics.js';
 export * from './repair.js';
+export * from './integrity.js';
