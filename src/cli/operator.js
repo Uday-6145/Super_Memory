@@ -964,7 +964,7 @@ export class OperatorCLI {
   /**
    * Helper: Model-assisted failure diagnosis and unapproved draft proposal generation
    */
-  async repair(workflowId, { inputsPath, inputs: directInputs, provider, allowLocalhost, headless } = {}) {
+  async repair(workflowId, { inputsPath, inputs: directInputs, provider, retries, allowLocalhost, headless } = {}) {
     if (!workflowId) {
       throw new WorkflowError('Missing workflow ID for repair command.');
     }
@@ -1096,7 +1096,12 @@ export class OperatorCLI {
     } else if (!modelProvider) {
       modelProvider = getPreferredRecoveryProvider();
     }
-    const proposalResult = await generateRepairProposal(modelProvider, diagnostic, activeVersion);
+    const proposalResult = await generateRepairProposal(
+      modelProvider,
+      diagnostic,
+      activeVersion,
+      retries !== undefined ? { retries } : {}
+    );
     const proposal = proposalResult.proposal;
 
     this.write(`Proposal received for step "${proposal.stepId}": ${redactSecrets(proposal.suspectedCause, secrets)}`);
@@ -1453,6 +1458,7 @@ export class OperatorCLI {
         'headless': { type: 'boolean', default: true },
         'enabled-only': { type: 'boolean' },
         'provider': { type: 'string' },
+        'retries': { type: 'string' },
         'offline': { type: 'boolean' },
         'help': { type: 'boolean', short: 'h' },
       },
@@ -1542,6 +1548,7 @@ export class OperatorCLI {
           await this.repair(targetId, {
             inputsPath: values.inputs,
             provider: values.provider,
+            retries: values.retries !== undefined ? Number.parseInt(values.retries, 10) : undefined,
             allowLocalhost: values['allow-localhost'],
             headless: values.headless !== false,
           });
@@ -1597,6 +1604,7 @@ Options:
   --evidence-out <path>         Path to write trial verification evidence (for trial)
   --confirm <phrase>            Operator confirmation phrase (PROMOTE <workflowId>)
   --yes, -y                     Accept confirmation non-interactively
+  --retries <n>                 Provider retry attempts for repair (default: 1; 0 disables retries)
   --allow-localhost             Allow navigation to loopback addresses (for local testing)
   --headless                    Run browser in headless mode (default: true)
   --enabled-only                Filter workflow list to only enabled workflows

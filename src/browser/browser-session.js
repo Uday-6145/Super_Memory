@@ -295,6 +295,21 @@ export class BrowserSession {
 
             const disabled = Boolean(el.disabled || el.getAttribute('aria-disabled') === 'true');
 
+            // Associated <label> text (el.labels covers label[for] and wrapping
+            // labels), falling back to aria-label. This is what getByLabel
+            // matches against, so repair grounding can verify labels exactly.
+            let label = '';
+            try {
+              if (el.labels && el.labels.length > 0) {
+                label = (el.labels[0].innerText || el.labels[0].textContent || '')
+                  .trim()
+                  .replace(/\s+/g, ' ');
+              }
+            } catch {}
+            if (!label) {
+              label = ariaLabel;
+            }
+
             // NOTE: Never extract el.value! Input values are strictly excluded.
             return {
               tag,
@@ -304,6 +319,7 @@ export class BrowserSession {
               placeholder: ariaPlaceholder,
               href,
               disabled,
+              label: label ? label.slice(0, 100) : null,
             };
           });
       }

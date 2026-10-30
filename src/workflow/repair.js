@@ -203,6 +203,88 @@ export function validateRepairProposal(proposal, workflowVersion) {
 }
 
 /**
+ * Grounds a structurally valid repair proposal in the observed page.
+ *
+ * A proposal is grounded only when its exact action target exists, enabled,
+ * in the sanitized diagnostic snapshot taken on the workflow's own target
+ * origin:
+ * - clickByRole: an element with the exact proposed role AND accessible name.
+ * - fillByLabel: a fillable element whose exact associated label (or
+ *   aria-label) equals the proposed label.
+ * - navigate: no element target; the relative path is already validated.
+ *
+ * Substrings of page text are never sufficient grounding. Ungrounded
+ * proposals are rejected before any draft can be created from them.
+ *
+ * @param {object} proposal - Proposal that passed validateRepairProposal
+ * @param {object} diagnosticRecord - Sanitized failure diagnostic with page snapshot
+ * @param {object} workflowVersion - The workflow version that failed
+ * @returns {{ valid: boolean }}
+ */
+export function validateRepairProposalGrounding(proposal, diagnosticRecord, workflowVersion) {
+  const change = proposal?.proposedChange;
+  if (!change || (change.action !== 'clickByRole' && change.action !== 'fillByLabel')) {
+    return { valid: true };
+  }
+
+  const snapshot = diagnosticRecord?.page?.snapshot;
+  const elements = Array.isArray(snapshot?.elements) ? snapshot.elements : null;
+  if (!elements) {
+    throw new RepairProposalError(
+      'Repair proposal cannot be grounded: no observed page snapshot is available.',
+      { path: 'proposedChange' }
+    );
+  }
+
+  // The observation must come from the workflow's declared target origin.
+  const targetOrigin = workflowVersion?.target?.origin;
+  if (targetOrigin && snapshot.url) {
+    let snapshotOrigin = null;
+    try {
+      snapshotOrigin = new URL(snapshot.url).origin;
+    } catch {}
+    if (snapshotOrigin !== targetOrigin) {
+      throw new RepairProposalError(
+        'Repair proposal cannot be grounded: the observed page is not on the workflow target origin.',
+        { path: 'proposedChange' }
+      );
+    }
+  }
+
+  if (change.action === 'clickByRole') {
+    const { role, name } = change.params || {};
+    const grounded = elements.some(
+      (el) => el && el.role === role && el.name === name && el.disabled !== true
+    );
+    if (!grounded) {
+      throw new RepairProposalError(
+        `Repair proposal target (role "${role}", name "${name}") was not observed on the current page. Refusing to create a draft from an ungrounded proposal.`,
+        { path: 'proposedChange.params.name' }
+      );
+    }
+    return { valid: true };
+  }
+
+  // fillByLabel
+  const { label } = change.params || {};
+  const grounded = elements.some((el) => {
+    if (!el || el.disabled === true) return false;
+    const fillable =
+      el.tag === 'input' || el.tag === 'textarea' || el.tag === 'select' || el.role === 'textbox';
+    if (!fillable) return false;
+    if (el.type === 'password' || el.type === '[REDACTED]') return false;
+    return el.label === label || el.name === label;
+  });
+  if (!grounded) {
+    throw new RepairProposalError(
+      `Repair proposal label "${label}" was not observed on the current page. Refusing to create a draft from an ungrounded proposal.`,
+      { path: 'proposedChange.params.label' }
+    );
+  }
+  return { valid: true };
+}
+
+/**
  * Applies a validated repair proposal to the steps of a workflow version,
  * producing a new candidate version record without mutating the original.
  *
@@ -295,7 +377,7 @@ export function buildRepairPrompt(diagnosticRecord, workflowVersion) {
   const elementsSummary = snapshot?.elements?.length
     ? snapshot.elements
         .slice(0, 30)
-        .map((el, i) => `[${i + 1}] tag: <${el.tag}>, role: "${el.role}", name: "${el.name}"${el.placeholder ? `, placeholder: "${el.placeholder}"` : ''}${el.href ? `, href: "${el.href}"` : ''}`)
+        .map((el, i) => `[${i + 1}] tag: <${el.tag}>, role: "${el.role}", name: "${el.name}"${el.label ? `, label: "${el.label}"` : ''}${el.placeholder ? `, placeholder: "${el.placeholder}"` : ''}${el.href ? `, href: "${el.href}"` : ''}`)
         .join('\n')
     : '(No interactive elements found on page)';
 
@@ -446,6 +528,9 @@ export async function generateRepairProposal(provider, diagnosticRecord, workflo
 
   const parsed = parseRepairResponse(completionResult.text);
   validateRepairProposal(parsed, workflowVersion);
+  // Grounding gate: reject targets not exactly observed on the current page
+  // before any draft can be created from this proposal.
+  validateRepairProposalGrounding(parsed, diagnosticRecord, workflowVersion);
 
   return {
     proposal: parsed,

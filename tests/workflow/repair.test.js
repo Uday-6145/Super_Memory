@@ -447,6 +447,144 @@ describe('Workflow Failure Diagnostics & Repair Flow', () => {
   // =========================================================================
   // 3. Model Generation & Response Parsing
   // =========================================================================
+  describe('Repair Proposal Grounding Gate', () => {
+    const groundedVersion = {
+      workflowId: 'wf_grounding',
+      version: 1,
+      inputs: [{ name: 'book_title', type: 'string', label: 'Book title', required: true }],
+      steps: [
+        {
+          id: 'step_find',
+          order: 1,
+          description: 'Click find',
+          action: 'clickByRole',
+          params: { role: 'button', name: 'Find books' },
+          anchor: null,
+          verification: null,
+        },
+      ],
+      target: { origin: 'http://127.0.0.1:8081', startPath: '/catalog' },
+      successCriteria: { finalPath: '/basket' },
+    };
+
+    function makeDiagnostic(elements, url = 'http://127.0.0.1:8081/catalog') {
+      return {
+        workflowId: 'wf_grounding',
+        version: 1,
+        category: 'ELEMENT_NOT_FOUND',
+        error: 'clickByRole timed out',
+        failedStep: { id: 'step_find', action: 'clickByRole' },
+        page: {
+          url,
+          title: 'City Books Catalog',
+          snapshot: { url, title: 'City Books Catalog', text: 'City Books Catalog', elements },
+        },
+      };
+    }
+
+    function makeProposal(params, action = 'clickByRole') {
+      return {
+        workflowId: 'wf_grounding',
+        targetVersion: 1,
+        stepId: 'step_find',
+        suspectedCause: 'Control changed',
+        evidence: 'Observed in snapshot',
+        proposedChange: { action, description: 'Updated step', params },
+        expectedOutcome: 'Step succeeds',
+        uncertainty: 'none',
+      };
+    }
+
+    const catalogElements = [
+      { tag: 'input', role: 'textbox', name: '', type: 'text', label: 'Book title', disabled: false },
+      { tag: 'button', role: 'button', name: 'Search catalog', type: 'submit', label: null, disabled: false },
+    ];
+
+    it('grounds a clickByRole proposal in the exact observed role and name', async () => {
+      const { validateRepairProposalGrounding } = await import('../../src/workflow/repair.js');
+      const proposal = makeProposal({ role: 'button', name: 'Search catalog', exact: false });
+      assert.equal(
+        validateRepairProposalGrounding(proposal, makeDiagnostic(catalogElements), groundedVersion).valid,
+        true
+      );
+    });
+
+    it('rejects an ungrounded clickByRole proposal before any draft', async () => {
+      const { validateRepairProposalGrounding } = await import('../../src/workflow/repair.js');
+      const proposal = makeProposal({ role: 'button', name: 'Find books', exact: false });
+      assert.throws(
+        () => validateRepairProposalGrounding(proposal, makeDiagnostic(catalogElements), groundedVersion),
+        (err) => err instanceof RepairProposalError && /was not observed on the current page/.test(err.message)
+      );
+    });
+
+    it('does not ground on a substring of an observed name or on page text', async () => {
+      const { validateRepairProposalGrounding } = await import('../../src/workflow/repair.js');
+      const proposal = makeProposal({ role: 'button', name: 'Search', exact: false });
+      assert.throws(
+        () => validateRepairProposalGrounding(proposal, makeDiagnostic(catalogElements), groundedVersion),
+        RepairProposalError
+      );
+    });
+
+    it('rejects a target observed only on a disabled element', async () => {
+      const { validateRepairProposalGrounding } = await import('../../src/workflow/repair.js');
+      const disabled = catalogElements.map((el) => ({ ...el, disabled: true }));
+      const proposal = makeProposal({ role: 'button', name: 'Search catalog', exact: false });
+      assert.throws(
+        () => validateRepairProposalGrounding(proposal, makeDiagnostic(disabled), groundedVersion),
+        RepairProposalError
+      );
+    });
+
+    it('grounds a fillByLabel proposal in the exact observed label', async () => {
+      const { validateRepairProposalGrounding } = await import('../../src/workflow/repair.js');
+      const proposal = makeProposal({ label: 'Book title', inputName: 'book_title', exact: false }, 'fillByLabel');
+      assert.equal(
+        validateRepairProposalGrounding(proposal, makeDiagnostic(catalogElements), groundedVersion).valid,
+        true
+      );
+    });
+
+    it('rejects an unobserved fillByLabel label', async () => {
+      const { validateRepairProposalGrounding } = await import('../../src/workflow/repair.js');
+      const proposal = makeProposal({ label: 'Title', inputName: 'book_title', exact: false }, 'fillByLabel');
+      assert.throws(
+        () => validateRepairProposalGrounding(proposal, makeDiagnostic(catalogElements), groundedVersion),
+        RepairProposalError
+      );
+    });
+
+    it('rejects grounding against a snapshot from a different origin', async () => {
+      const { validateRepairProposalGrounding } = await import('../../src/workflow/repair.js');
+      const proposal = makeProposal({ role: 'button', name: 'Search catalog', exact: false });
+      assert.throws(
+        () =>
+          validateRepairProposalGrounding(
+            proposal,
+            makeDiagnostic(catalogElements, 'http://127.0.0.1:9999/catalog'),
+            groundedVersion
+          ),
+        /not on the workflow target origin/
+      );
+    });
+
+    it('generateRepairProposal rejects an ungrounded model proposal end-to-end', async () => {
+      const provider = {
+        complete: async () => ({
+          text: JSON.stringify(makeProposal({ role: 'button', name: 'Find books', exact: false })),
+          usage: { totalTokens: 5 },
+          provider: 'mock',
+          model: 'mock-1',
+        }),
+      };
+      await assert.rejects(
+        () => generateRepairProposal(provider, makeDiagnostic(catalogElements), groundedVersion),
+        (err) => err instanceof RepairProposalError && /was not observed/.test(err.message)
+      );
+    });
+  });
+
   describe('Model Proposal Generation & Parsing', () => {
     it('parses JSON wrapped in markdown code blocks or with surrounding text', () => {
       const rawWithFences = '```json\n{"hello": "world"}\n```';
@@ -509,7 +647,16 @@ describe('Workflow Failure Diagnostics & Repair Flow', () => {
         category: 'ELEMENT_NOT_FOUND',
         error: 'Element not found',
         failedStep: dummyVersion.steps[0],
-        page: { url: 'http://127.0.0.1:8080/checkout', title: 'Test', snapshot: null },
+        page: {
+          url: 'http://127.0.0.1:8080/checkout',
+          title: 'Test',
+          snapshot: {
+            url: 'http://127.0.0.1:8080/checkout',
+            title: 'Test',
+            text: 'Checkout',
+            elements: [{ tag: 'button', role: 'button', name: 'New Label', type: 'submit', disabled: false }],
+          },
+        },
       };
 
       const result = await generateRepairProposal(mockProvider, diag, dummyVersion);
