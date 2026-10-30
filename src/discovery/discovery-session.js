@@ -227,37 +227,51 @@ export class DiscoveryOrchestrator {
    * @param {object} observation
    * @returns {{ passed: boolean, details: string }}
    */
-  _evaluateSuccessConditions(intent, observation) {
-    if (!intent.successConditions || intent.successConditions.length === 0) {
+  _evaluateSuccessConditions(intent, rawEvidence) {
+    const conditions = Array.isArray(intent?.successConditions) ? intent.successConditions : [];
+    if (conditions.length === 0) {
       return { passed: true, details: 'No explicit success conditions declared.' };
     }
 
-    const currentUrl = observation?.url || '';
-    const currentTitle = observation?.title || '';
-    const currentText = observation?.text || '';
+    // Raw browser evidence is trusted-local only. It must never be forwarded to
+    // the provider, events, journals, diagnostics, or persisted artifacts. The
+    // result intentionally reports only whether every condition passed.
+    if (!rawEvidence || typeof rawEvidence !== 'object' || Array.isArray(rawEvidence)) {
+      return { passed: false, details: 'Success conditions were not satisfied.' };
+    }
+
+    const currentUrl = typeof rawEvidence.url === 'string' ? rawEvidence.url : '';
+    const currentTitle = typeof rawEvidence.title === 'string' ? rawEvidence.title : '';
+    const currentText = typeof rawEvidence.text === 'string' ? rawEvidence.text : '';
 
     let pathname = '';
     try {
       pathname = new URL(currentUrl).pathname;
     } catch {}
 
-    for (const cond of intent.successConditions) {
+    for (const cond of conditions) {
+      if (!cond || typeof cond.expected !== 'string' || cond.expected.trim() === '') {
+        return { passed: false, details: 'Success conditions were not satisfied.' };
+      }
+
       if (cond.type === 'finalPath') {
         if (pathname !== cond.expected && !pathname.endsWith(cond.expected)) {
-          return { passed: false, details: `Path mismatch: expected "${cond.expected}", got "${pathname}".` };
+          return { passed: false, details: 'Success conditions were not satisfied.' };
         }
       } else if (cond.type === 'pageTitle') {
         if (!currentTitle.includes(cond.expected)) {
-          return { passed: false, details: `Title mismatch: "${cond.expected}" not found in "${currentTitle}".` };
+          return { passed: false, details: 'Success conditions were not satisfied.' };
         }
       } else if (cond.type === 'textPresent') {
         if (!currentText.includes(cond.expected)) {
-          return { passed: false, details: `Text present missing: "${cond.expected}" not found in page text.` };
+          return { passed: false, details: 'Success conditions were not satisfied.' };
         }
       } else if (cond.type === 'textAbsent') {
         if (currentText.includes(cond.expected)) {
-          return { passed: false, details: `Text absent failed: "${cond.expected}" was found in page text.` };
+          return { passed: false, details: 'Success conditions were not satisfied.' };
         }
+      } else {
+        return { passed: false, details: 'Success conditions were not satisfied.' };
       }
     }
 
@@ -444,10 +458,11 @@ export class DiscoveryOrchestrator {
           done: Boolean(decision.done),
         });
 
-        // If model declares done, verify outcome
+        // If model declares done, verify outcome against raw local evidence.
+        // The model only receives the sanitized observation above.
         if (decision.done) {
           state = 'VERIFY_OUTCOME';
-          const outcome = this._evaluateSuccessConditions(intent, observation);
+          const outcome = this._evaluateSuccessConditions(intent, rawSnapshot);
           if (outcome.passed) {
             if (trace.length === 0) {
               state = 'ABORTED_UNVERIFIABLE';
@@ -670,7 +685,9 @@ export class DiscoveryOrchestrator {
             this._emit('journal_error', { message: err.message });
           }
         }
-        const autoOutcome = this._evaluateSuccessConditions(intent, postObservation);
+        // Verify with the raw post-action snapshot before it crosses any
+        // redaction, logging, journal, or candidate-conversion boundary.
+        const autoOutcome = this._evaluateSuccessConditions(intent, postSnapshot);
 
         if (autoOutcome.passed) {
           if (trace.length === 0) {
