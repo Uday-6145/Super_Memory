@@ -11,6 +11,8 @@
  * 4. Objective match: workflowId, name, or description overlap with intent objective tokens.
  */
 
+import { isCriterionInputRef, resolveSuccessCriteria } from '../workflow/schema.js';
+
 /**
  * Searches the repository for a verified workflow matching the TaskIntent.
  *
@@ -47,11 +49,65 @@ function countSharedTokens(left, right) {
 }
 
 function isSuccessCriteriaCompatible(intent, workflowSuccessCriteria = {}) {
+  // Structural matching and runtime-value resolution stay separate:
+  // - A saved reference {"input": name} structurally matches only a request
+  //   condition bound to the same input name; against a literal request it is
+  //   resolved with the request's own parameter values.
+  // - A saved literal matches only the request's resolved literal value, so a
+  //   literal "Paneer Toast" workflow never matches a "Fresh Paneer Pizza"
+  //   request (and vice versa).
+  const parameterValues = {};
+  for (const param of intent.parameters || []) {
+    if (param && typeof param.name === 'string') {
+      parameterValues[param.name] = param.value;
+    }
+  }
+  const { criteria: resolvedSaved, unresolved: unresolvedSaved } = resolveSuccessCriteria(
+    workflowSuccessCriteria,
+    parameterValues
+  );
+
   for (const condition of intent.successConditions || []) {
-    if (!condition || typeof condition.expected !== 'string') {
+    if (!condition || typeof condition.type !== 'string') {
       return false;
     }
-    if (workflowSuccessCriteria[condition.type] !== condition.expected) {
+    const saved = workflowSuccessCriteria[condition.type];
+    if (saved === undefined) {
+      return false;
+    }
+
+    if (isCriterionInputRef(saved)) {
+      if (condition.input !== undefined) {
+        // Structural binding: both sides must reference the same declared input.
+        if (condition.input !== saved.input) {
+          return false;
+        }
+        continue;
+      }
+      // Literal request against a parameterized workflow: resolve the saved
+      // reference with this request's values and compare resolved literals.
+      if (unresolvedSaved.includes(saved.input)) {
+        return false;
+      }
+      if (resolvedSaved[condition.type] !== condition.expected) {
+        return false;
+      }
+      continue;
+    }
+
+    // Saved criterion is a literal: resolve the request side, then compare.
+    let requested;
+    if (condition.input !== undefined) {
+      requested = parameterValues[condition.input];
+      if (typeof requested !== 'string' || requested.trim() === '') {
+        return false;
+      }
+    } else if (typeof condition.expected === 'string') {
+      requested = condition.expected;
+    } else {
+      return false;
+    }
+    if (saved !== requested) {
       return false;
     }
   }

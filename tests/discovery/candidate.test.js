@@ -96,6 +96,83 @@ describe('Discovery Engine — Candidate Conversion', () => {
     assert.equal(contentHash, recomputedHash);
   });
 
+  it('buildCandidateFromTrace emits input references and schemaVersion 1.1.0 for parameter-bound conditions', () => {
+    const intent = createTaskIntent({
+      taskId: 't_demo_param',
+      objective: 'Search for the requested item and add it',
+      targetOrigin: 'http://127.0.0.1:8080',
+      startPath: '/store',
+      parameters: [
+        { name: 'search_item', value: 'Paneer Toast', label: 'Search Product', description: 'Requested product' },
+      ],
+      successConditions: [
+        { type: 'finalPath', expected: '/cart' },
+        { type: 'textPresent', input: 'search_item' },
+      ],
+    });
+
+    const trace = [
+      {
+        stepIndex: 0,
+        decision: {
+          action: 'fillByLabel',
+          label: 'Search Product',
+          inputName: 'search_item',
+          rationale: 'Fill search box',
+        },
+        observedElement: {
+          role: 'textbox',
+          name: 'Search Product',
+          tag: 'input',
+          type: 'text',
+          placeholder: 'Search...',
+        },
+        result: { ok: true, status: 200, durationMs: 40 },
+      },
+    ];
+
+    const { candidate, contentHash } = buildCandidateFromTrace({
+      trace,
+      intent,
+      finalObservation: { url: 'http://127.0.0.1:8080/cart', text: 'Cart Paneer Toast' },
+    });
+
+    assert.equal(candidate.schemaVersion, '1.1.0');
+    assert.deepEqual(candidate.successCriteria, {
+      finalPath: '/cart',
+      textPresent: { input: 'search_item' },
+    });
+    assert.doesNotThrow(() => validateWorkflowVersion(candidate));
+    assert.equal(calculateContentHash(candidate), contentHash);
+    // The runtime product value is never baked into the reusable definition.
+    assert.ok(!JSON.stringify(candidate).includes('Paneer Toast'));
+  });
+
+  it('buildCandidateFromTrace keeps purely literal candidates at schemaVersion 1.0.0', () => {
+    const intent = createTaskIntent({
+      taskId: 't_demo_literal',
+      objective: 'Search for paneer and checkout',
+      targetOrigin: 'http://127.0.0.1:8080',
+      startPath: '/store',
+      parameters: [{ name: 'query', value: 'paneer', label: 'Search Item' }],
+      successConditions: [{ type: 'finalPath', expected: '/complete' }],
+    });
+    const trace = [
+      {
+        stepIndex: 0,
+        decision: { action: 'fillByLabel', label: 'Search Item', inputName: 'query', rationale: 'Fill search box' },
+        observedElement: { role: 'textbox', name: 'Search Item', tag: 'input', type: 'text' },
+        result: { ok: true, status: 200, durationMs: 40 },
+      },
+    ];
+    const { candidate } = buildCandidateFromTrace({
+      trace,
+      intent,
+      finalObservation: { url: 'http://127.0.0.1:8080/complete', text: 'Done' },
+    });
+    assert.equal(candidate.schemaVersion, '1.0.0');
+  });
+
   it('buildCandidateFromTrace rejects empty trace', () => {
     const intent = createTaskIntent({
       objective: 'Test',

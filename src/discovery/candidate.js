@@ -172,17 +172,28 @@ export function buildCandidateFromTrace({ trace, intent, finalObservation }) {
     throw new CandidateConversionError('Discovery trace contains no successful actions to convert.');
   }
 
-  // 3. Success Criteria derived from intent conditions and final observation
+  // 3. Success Criteria derived from intent conditions and final observation.
+  // Parameter-bound conditions ({type, input}) become inert input references;
+  // literal conditions stay literal. Using any reference requires 1.1.0.
   const successCriteria = {};
+  let usesInputReference = false;
   for (const cond of intent.successConditions || []) {
-    if (cond.type === 'finalPath') {
-      successCriteria.finalPath = cond.expected;
-    } else if (cond.type === 'pageTitle') {
-      successCriteria.pageTitle = cond.expected;
-    } else if (cond.type === 'textPresent') {
-      successCriteria.textPresent = cond.expected;
-    } else if (cond.type === 'textAbsent') {
-      successCriteria.textAbsent = cond.expected;
+    const keyByType = {
+      finalPath: 'finalPath',
+      pageTitle: 'pageTitle',
+      textPresent: 'textPresent',
+      textAbsent: 'textAbsent',
+    };
+    const key = keyByType[cond.type];
+    if (!key) continue;
+    if (cond.input !== undefined) {
+      if (cond.type === 'finalPath') {
+        throw new CandidateConversionError('finalPath success conditions cannot reference an input.');
+      }
+      successCriteria[key] = { input: cond.input };
+      usesInputReference = true;
+    } else {
+      successCriteria[key] = cond.expected;
     }
   }
 
@@ -203,7 +214,9 @@ export function buildCandidateFromTrace({ trace, intent, finalObservation }) {
 
   const candidateVersion = {
     $schema: 'https://supermemory.dev/schemas/v1/workflow-version.json',
-    schemaVersion: '1.0.0',
+    // Parameter-bound criteria require the 1.1.0 value-source representation;
+    // purely literal candidates remain 1.0.0 for maximum compatibility.
+    schemaVersion: usesInputReference ? '1.1.0' : '1.0.0',
     workflowId,
     version: 1,
     status: 'draft',

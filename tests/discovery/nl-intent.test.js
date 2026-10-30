@@ -104,4 +104,58 @@ describe('Discovery Engine — Constrained Natural-Language Intent', () => {
       /cannot interpret free text.*--intent/
     );
   });
+
+  it('accepts an input reference bound to a caller-supplied fixed parameter', async () => {
+    const provider = makeNlMock({
+      objective: 'Find the requested item and add it to the cart',
+      parameters: [{ name: 'search_item', value: 'Paneer Toast' }],
+      constraints: [],
+      successConditions: [
+        { type: 'finalPath', expected: '/cart' },
+        { type: 'textPresent', input: 'search_item' },
+      ],
+      approvalRequired: [],
+      forbidden: [],
+    });
+
+    const intent = await parseNaturalLanguageTask({
+      provider,
+      request: 'Find Paneer Toast and add it to the cart',
+      targetOrigin: ORIGIN,
+      startPath: '/store',
+      fixedParameters: [{ name: 'search_item', value: 'Paneer Toast' }],
+      taskId: 'task_nl_ref_authorized',
+    });
+
+    assert.deepEqual(intent.successConditions, [
+      { type: 'finalPath', expected: '/cart' },
+      { type: 'textPresent', input: 'search_item' },
+    ]);
+  });
+
+  it('rejects a model-invented input reference that is not caller-supplied', async () => {
+    const provider = makeNlMock({
+      objective: 'Find the requested item and add it to the cart',
+      parameters: [{ name: 'credit_card', value: '4111111111111111' }],
+      constraints: [],
+      successConditions: [
+        { type: 'finalPath', expected: '/cart' },
+        { type: 'textPresent', input: 'credit_card' },
+      ],
+      approvalRequired: [],
+      forbidden: [],
+    });
+
+    await assert.rejects(
+      () =>
+        parseNaturalLanguageTask({
+          provider,
+          request: 'Find Paneer Toast and add it to the cart',
+          targetOrigin: ORIGIN,
+          startPath: '/store',
+          fixedParameters: [{ name: 'search_item', value: 'Paneer Toast' }],
+        }),
+      (err) => err instanceof NaturalLanguageIntentError && /not a caller-supplied parameter/.test(err.message)
+    );
+  });
 });

@@ -118,5 +118,68 @@ describe('Discovery Engine — Task Intent Validation', () => {
     assert.equal(intent.targetOrigin, 'http://127.0.0.1:8080');
     assert.equal(validateTaskIntent(intent).valid, true);
   });
+
+  it('accepts a parameter-bound success condition referencing a declared parameter', () => {
+    const intent = createTaskIntent({
+      objective: 'Find the requested item and add it',
+      targetOrigin: 'http://127.0.0.1:8080',
+      startPath: '/store',
+      parameters: [{ name: 'search_item', value: 'Paneer Toast' }],
+      successConditions: [
+        { type: 'finalPath', expected: '/cart' },
+        { type: 'textPresent', input: 'search_item' },
+      ],
+    });
+    assert.deepEqual(intent.successConditions[1], { type: 'textPresent', input: 'search_item' });
+    assert.equal(validateTaskIntent(intent).valid, true);
+  });
+
+  it('rejects a success condition referencing an undeclared parameter', () => {
+    assert.throws(
+      () =>
+        validateTaskIntent({
+          taskId: 't1',
+          objective: 'Buy item',
+          targetOrigin: 'http://127.0.0.1:8080',
+          startPath: '/',
+          parameters: [{ name: 'search_item', value: 'Paneer Toast' }],
+          successConditions: [{ type: 'textPresent', input: 'other_item' }],
+        }),
+      (err) => err instanceof TaskIntentError && /undeclared parameter/.test(err.message)
+    );
+  });
+
+  it('rejects a condition with both expected and input, or neither', () => {
+    const base = {
+      taskId: 't1',
+      objective: 'Buy item',
+      targetOrigin: 'http://127.0.0.1:8080',
+      startPath: '/',
+      parameters: [{ name: 'search_item', value: 'Paneer Toast' }],
+    };
+    assert.throws(
+      () => validateTaskIntent({ ...base, successConditions: [{ type: 'textPresent', expected: 'x', input: 'search_item' }] }),
+      /exactly one of "expected"/
+    );
+    assert.throws(
+      () => validateTaskIntent({ ...base, successConditions: [{ type: 'textPresent' }] }),
+      /exactly one of "expected"/
+    );
+  });
+
+  it('rejects an input reference for finalPath', () => {
+    assert.throws(
+      () =>
+        validateTaskIntent({
+          taskId: 't1',
+          objective: 'Buy item',
+          targetOrigin: 'http://127.0.0.1:8080',
+          startPath: '/',
+          parameters: [{ name: 'search_item', value: '/cart' }],
+          successConditions: [{ type: 'finalPath', input: 'search_item' }],
+        }),
+      /must use a literal "expected" path/
+    );
+  });
 });
 

@@ -244,30 +244,53 @@ export class DiscoveryOrchestrator {
     const currentTitle = typeof rawEvidence.title === 'string' ? rawEvidence.title : '';
     const currentText = typeof rawEvidence.text === 'string' ? rawEvidence.text : '';
 
+    // Parameter-bound conditions resolve locally from declared task
+    // parameters. Resolved values stay inside this trusted-local evaluation:
+    // they are never emitted in details, events, journals, or model prompts.
+    const parameterValues = {};
+    for (const param of intent?.parameters || []) {
+      if (param && typeof param.name === 'string') {
+        parameterValues[param.name] = param.value;
+      }
+    }
+
     let pathname = '';
     try {
       pathname = new URL(currentUrl).pathname;
     } catch {}
 
     for (const cond of conditions) {
-      if (!cond || typeof cond.expected !== 'string' || cond.expected.trim() === '') {
+      if (!cond || typeof cond !== 'object') {
+        return { passed: false, details: 'Success conditions were not satisfied.' };
+      }
+
+      let expected;
+      if (cond.input !== undefined) {
+        const resolved = parameterValues[cond.input];
+        if (typeof resolved !== 'string' || resolved.trim() === '') {
+          return { passed: false, details: 'Success conditions were not satisfied.' };
+        }
+        expected = resolved;
+      } else if (typeof cond.expected === 'string' && cond.expected.trim() !== '') {
+        expected = cond.expected;
+      } else {
         return { passed: false, details: 'Success conditions were not satisfied.' };
       }
 
       if (cond.type === 'finalPath') {
-        if (pathname !== cond.expected && !pathname.endsWith(cond.expected)) {
+        if (cond.input !== undefined || (pathname !== expected && !pathname.endsWith(expected))) {
           return { passed: false, details: 'Success conditions were not satisfied.' };
         }
       } else if (cond.type === 'pageTitle') {
-        if (!currentTitle.includes(cond.expected)) {
+        if (!currentTitle.includes(expected)) {
           return { passed: false, details: 'Success conditions were not satisfied.' };
         }
       } else if (cond.type === 'textPresent') {
-        if (!currentText.includes(cond.expected)) {
+        if (!currentText.includes(expected)) {
           return { passed: false, details: 'Success conditions were not satisfied.' };
         }
       } else if (cond.type === 'textAbsent') {
-        if (currentText.includes(cond.expected)) {
+        if (currentText.includes(expected)) {
           return { passed: false, details: 'Success conditions were not satisfied.' };
         }
       } else {
@@ -287,6 +310,34 @@ export class DiscoveryOrchestrator {
    * @returns {Promise<{ status: string, reason?: string, candidate?: object, contentHash?: string, trace: Array<object>, eventsCount: number }>}
    */
   async runDiscovery(intent, options = {}) {
+    // Preflight: every parameter referenced by a success condition must have
+    // a usable value before any browser session or action begins. A
+    // referenced parameter is required for this run even if the intent lists
+    // it with an empty value. The reason names parameters only, never values.
+    const parameterValues = {};
+    for (const param of intent?.parameters || []) {
+      if (param && typeof param.name === 'string') {
+        parameterValues[param.name] = param.value;
+      }
+    }
+    const unresolvedRefs = [];
+    for (const cond of intent?.successConditions || []) {
+      if (cond && cond.input !== undefined) {
+        const value = parameterValues[cond.input];
+        if (typeof value !== 'string' || value.trim() === '') {
+          unresolvedRefs.push(cond.input);
+        }
+      }
+    }
+    if (unresolvedRefs.length > 0) {
+      return {
+        status: 'ABORTED_UNVERIFIABLE',
+        reason: `Success conditions reference task parameters that were not supplied with usable values: ${[...new Set(unresolvedRefs)].join(', ')}.`,
+        trace: [],
+        eventsCount: 0,
+      };
+    }
+
     const secrets = (intent.parameters || [])
       .map((p) => p.value)
       .filter((v) => typeof v === 'string' && v.trim().length > 0);

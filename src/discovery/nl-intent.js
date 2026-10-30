@@ -140,6 +140,8 @@ export async function parseNaturalLanguageTask({
 Return ONLY a JSON object with exactly these keys: objective, parameters, constraints, successConditions, approvalRequired, forbidden.
 Do not include targetOrigin, startPath, taskId, workflow IDs, URLs, secrets, or explanatory text.
 Parameters must be objects with name and value; successConditions must be non-empty and use only finalPath, pageTitle, textPresent, or textAbsent.
+A successCondition is either {"type": "...", "expected": "literal text"} or {"type": "...", "input": "<parameter-name>"}.
+Use the "input" form ONLY with a parameter name from the caller-supplied fixed parameters listed in the request; never invent a parameter name for an "input" reference, and never use "input" for finalPath.
 If required details are missing, return {"objective": "", "parameters": [], "constraints": [], "successConditions": [], "approvalRequired": [], "forbidden": []}.`;
 
   const userMessage = `REQUEST:
@@ -171,6 +173,22 @@ Emit the constrained JSON draft now:`;
   }
 
   const draft = validateNaturalLanguageDraft(parseNaturalLanguageTaskResponse(completion?.text));
+
+  // Reference authorization: the model may bind a success condition only to a
+  // caller-supplied (fixed) parameter. It must never introduce an arbitrary
+  // reference or bind a condition to a parameter it invented itself.
+  const authorizedInputNames = new Set(
+    (fixedParameters || []).map((p) => p?.name).filter((name) => typeof name === 'string')
+  );
+  for (const condition of draft.successConditions || []) {
+    if (condition && condition.input !== undefined && !authorizedInputNames.has(condition.input)) {
+      throw new NaturalLanguageIntentError(
+        `Natural-language intent referenced input "${condition.input}", which is not a caller-supplied parameter. Provide it via --inputs/--intent or use a literal success condition.`,
+        { path: 'successConditions', needsClarification: true }
+      );
+    }
+  }
+
   const parameters = mergeFixedParameters(draft.parameters, fixedParameters);
 
   return createTaskIntent({

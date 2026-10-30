@@ -162,6 +162,63 @@ export function deriveSecrets(...sources) {
 }
 
 /**
+ * Establishes the single validated source of truth for effective runtime
+ * inputs during discovery: the merge of TaskIntent parameters and any
+ * separately supplied runtime inputs (direct object or --inputs file).
+ *
+ * Rules (fail closed; error messages name inputs, never values):
+ * - Every runtime input must be declared as a task parameter.
+ * - When both sources supply a non-empty value for the same input, the
+ *   values must agree exactly; a conflict is rejected rather than silently
+ *   preferring one source across discovery, lookup, and playback.
+ * - An empty intent value means "supplied at runtime" and is filled from
+ *   the runtime inputs; otherwise the intent value is the effective value.
+ *
+ * @param {object} intent - Validated TaskIntent
+ * @param {object} runtimeInputs - Runtime input values by name
+ * @returns {Record<string, string>} Effective runtime inputs by name
+ */
+export function resolveEffectiveInputs(intent, runtimeInputs = {}) {
+  if (!runtimeInputs || typeof runtimeInputs !== 'object' || Array.isArray(runtimeInputs)) {
+    throw new WorkflowError('Runtime inputs must be an object mapping input names to string values.');
+  }
+
+  const declared = new Map();
+  for (const param of intent?.parameters || []) {
+    if (param && typeof param.name === 'string') {
+      declared.set(param.name, param);
+    }
+  }
+
+  const inputs = {};
+  for (const [name, value] of Object.entries(runtimeInputs)) {
+    if (typeof value !== 'string') {
+      throw new WorkflowError(`Runtime input "${name}" must be a string value.`);
+    }
+    if (!declared.has(name)) {
+      throw new WorkflowError(
+        `Runtime input "${name}" is not declared in the task intent parameters. Declare it in the intent or remove it from the inputs file.`
+      );
+    }
+    const intentValue = declared.get(name).value;
+    if (typeof intentValue === 'string' && intentValue !== '' && value !== intentValue) {
+      throw new WorkflowError(
+        `Runtime input "${name}" conflicts with the task intent parameter of the same name. Provide one consistent value in the intent and the inputs file.`
+      );
+    }
+    inputs[name] = value;
+  }
+
+  for (const param of intent?.parameters || []) {
+    if (param && typeof param.name === 'string' && inputs[param.name] === undefined) {
+      inputs[param.name] = param.value;
+    }
+  }
+
+  return inputs;
+}
+
+/**
  * Formats a clean ASCII table for workflow listings.
  *
  * @param {Array<string>} headers
@@ -1090,6 +1147,7 @@ export class OperatorCLI {
     journalDir = path.join(os.tmpdir(), 'super-memory-discovery-journal'),
   } = {}) {
     let intent;
+    let preloadedInputs;
     if (intentPath) {
       const resolved = path.resolve(intentPath);
       let raw;
@@ -1122,6 +1180,7 @@ export class OperatorCLI {
         throw new Error('Plain-language discovery requires an explicit --origin. The model must not invent a target origin.');
       }
       const loadedParams = directInputs || (inputsPath ? await loadInputs(inputsPath) : {});
+      preloadedInputs = loadedParams;
       const fixedParams = Array.isArray(parameters) && parameters.length > 0
         ? parameters
         : Object.entries(loadedParams).map(([name, value]) => ({ name, value: String(value) }));
@@ -1163,6 +1222,21 @@ export class OperatorCLI {
       }
     }
 
+    // Single source of truth for effective runtime inputs: intent parameters
+    // reconciled with any separately supplied runtime inputs. Conflicts,
+    // undeclared runtime inputs, and non-string values are rejected here so
+    // discovery, lookup, secrets, and playback can never silently diverge.
+    const runtimeInputs = directInputs || preloadedInputs || (inputsPath ? await loadInputs(inputsPath) : {});
+    const effectiveInputs = resolveEffectiveInputs(intent, runtimeInputs);
+    intent = {
+      ...intent,
+      parameters: (intent.parameters || []).map((param) => ({
+        ...param,
+        value: effectiveInputs[param.name],
+      })),
+    };
+    validateTaskIntent(intent);
+
     const isLocalhostAllowed = allowLocalhost ?? this.allowLocalhost;
     const isHeadless = headless ?? this.headless;
 
@@ -1187,12 +1261,7 @@ export class OperatorCLI {
       this.write(`\n[Lookup Hit] Found existing verified workflow "${match.workflowId}" (v${match.version}).`);
       this.write('Reusing verified workflow without model discovery calls...');
 
-      const inputs = directInputs || (inputsPath ? await loadInputs(inputsPath) : {});
-      for (const p of intent.parameters || []) {
-        if (inputs[p.name] === undefined) {
-          inputs[p.name] = p.value;
-        }
-      }
+      const inputs = effectiveInputs;
 
       const playResult = await this.play(match.workflowId, {
         inputs,
@@ -1335,6 +1404,7 @@ export class OperatorCLI {
         inputs: discoveryRes.candidate.inputs,
         steps: discoveryRes.candidate.steps,
         successCriteria: discoveryRes.candidate.successCriteria,
+        schemaVersion: discoveryRes.candidate.schemaVersion,
       });
 
       this.write(`Successfully created workflow "${discoveryRes.candidate.workflowId}" with unapproved draft v1.`);

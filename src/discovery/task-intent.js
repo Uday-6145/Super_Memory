@@ -143,7 +143,45 @@ export function validateTaskIntent(intent) {
         { path: `successConditions[${i}].type` }
       );
     }
-    if (typeof sc.expected !== 'string' || sc.expected.trim() === '') {
+    // A condition carries exactly one value source: a literal "expected" string
+    // or an "input" reference to a declared task parameter. References are
+    // inert names, resolved locally at verification time; finalPath stays
+    // literal-only so navigation targets can never be input-driven.
+    for (const key of Object.keys(sc)) {
+      if (key !== 'type' && key !== 'expected' && key !== 'input') {
+        throw new TaskIntentError(`Unknown field "${key}" in successCondition at index ${i}.`, {
+          path: `successConditions[${i}].${key}`,
+        });
+      }
+    }
+    const hasExpected = sc.expected !== undefined;
+    const hasInput = sc.input !== undefined;
+    if (hasExpected === hasInput) {
+      throw new TaskIntentError(
+        `successCondition at index ${i} must declare exactly one of "expected" (literal) or "input" (declared parameter reference).`,
+        { path: `successConditions[${i}]` }
+      );
+    }
+    if (hasInput) {
+      if (sc.type === 'finalPath') {
+        throw new TaskIntentError(
+          `successCondition "finalPath" at index ${i} must use a literal "expected" path; input references are not allowed.`,
+          { path: `successConditions[${i}].input` }
+        );
+      }
+      if (typeof sc.input !== 'string' || !/^[a-zA-Z][a-zA-Z0-9_]{0,49}$/.test(sc.input)) {
+        throw new TaskIntentError(
+          `successCondition "input" at index ${i} must be a valid parameter name.`,
+          { path: `successConditions[${i}].input` }
+        );
+      }
+      if (!seenParamNames.has(sc.input)) {
+        throw new TaskIntentError(
+          `successCondition at index ${i} references undeclared parameter "${sc.input}". Only declared task parameters may be referenced.`,
+          { path: `successConditions[${i}].input` }
+        );
+      }
+    } else if (typeof sc.expected !== 'string' || sc.expected.trim() === '') {
       throw new TaskIntentError(`successCondition "expected" at index ${i} must be a non-empty string.`, {
         path: `successConditions[${i}].expected`,
       });
@@ -173,7 +211,7 @@ export function validateTaskIntent(intent) {
  * @param {string} [options.startPath='/']
  * @param {Array<{ name: string, value: string, label?: string, description?: string }>} [options.parameters=[]]
  * @param {Array<object>} [options.constraints=[]]
- * @param {Array<{ type: string, expected: string }>} options.successConditions
+ * @param {Array<{ type: string, expected?: string, input?: string }>} options.successConditions - Literal {type, expected} or parameter-bound {type, input}
  * @param {Array<string>} [options.approvalRequired=[]]
  * @param {Array<string>} [options.forbidden=[]]
  * @returns {object} Validated TaskIntent object
@@ -205,10 +243,11 @@ export function createTaskIntent({
       description: p.description ? String(p.description).trim() : undefined,
     })),
     constraints: [...constraints],
-    successConditions: successConditions.map((sc) => ({
-      type: String(sc.type || '').trim(),
-      expected: String(sc.expected || '').trim(),
-    })),
+    successConditions: successConditions.map((sc) =>
+      sc && sc.input !== undefined
+        ? { type: String(sc.type || '').trim(), input: String(sc.input || '').trim() }
+        : { type: String(sc?.type || '').trim(), expected: String(sc?.expected || '').trim() }
+    ),
     approvalRequired: [...approvalRequired],
     forbidden: [...forbidden],
   };

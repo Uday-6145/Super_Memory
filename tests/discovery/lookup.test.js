@@ -139,6 +139,90 @@ describe('Discovery Engine — Conservative Workflow Lookup', () => {
     );
   });
 
+  it('matches the same parameterized workflow for different runtime products', async () => {
+    const manifest = makeManifest(
+      'search_requested_item_add',
+      'Search requested item and add it',
+      'Search for the requested item and add it to the cart'
+    );
+    const version = {
+      ...makeActiveVersion(),
+      successCriteria: { finalPath: '/cart', textPresent: { input: 'search_item' } },
+    };
+    const repository = makeRepository([[manifest, version]]);
+
+    for (const product of ['Paneer Toast', 'Fresh Paneer Pizza']) {
+      const intent = createTaskIntent({
+        taskId: `task_lookup_${product.length}`,
+        objective: 'Search for the requested item and add it',
+        targetOrigin: ORIGIN,
+        startPath: START_PATH,
+        parameters: [{ name: 'search_item', value: product }],
+        successConditions: [
+          { type: 'finalPath', expected: '/cart' },
+          { type: 'textPresent', input: 'search_item' },
+        ],
+      });
+      const result = await findMatchingWorkflow(repository, intent);
+      assert.equal(result.match, true, `parameterized workflow must match ${product}`);
+      assert.equal(result.workflowId, 'search_requested_item_add');
+    }
+  });
+
+  it('does not match a literal Paneer Toast workflow for a Fresh Paneer Pizza request', async () => {
+    const manifest = makeManifest(
+      'search_requested_item_add',
+      'Search requested item and add it',
+      'Search for the requested item and add it to the cart'
+    );
+    const version = {
+      ...makeActiveVersion(),
+      successCriteria: { finalPath: '/cart', textPresent: 'Paneer Toast' },
+    };
+    const repository = makeRepository([[manifest, version]]);
+
+    const intent = createTaskIntent({
+      taskId: 'task_lookup_literal_mismatch',
+      objective: 'Search for the requested item and add it',
+      targetOrigin: ORIGIN,
+      startPath: START_PATH,
+      parameters: [{ name: 'search_item', value: 'Fresh Paneer Pizza' }],
+      successConditions: [
+        { type: 'finalPath', expected: '/cart' },
+        { type: 'textPresent', input: 'search_item' },
+      ],
+    });
+    const result = await findMatchingWorkflow(repository, intent);
+    assert.equal(result.match, false);
+  });
+
+  it('matches a parameterized workflow for a literal request whose value resolves through the referenced input', async () => {
+    const manifest = makeManifest(
+      'search_requested_item_add',
+      'Search requested item and add it',
+      'Search for the requested item and add it to the cart'
+    );
+    const version = {
+      ...makeActiveVersion(),
+      successCriteria: { finalPath: '/cart', textPresent: { input: 'search_item' } },
+    };
+    const repository = makeRepository([[manifest, version]]);
+
+    const intent = createTaskIntent({
+      taskId: 'task_lookup_literal_request',
+      objective: 'Search for the requested item and add it',
+      targetOrigin: ORIGIN,
+      startPath: START_PATH,
+      parameters: [{ name: 'search_item', value: 'Paneer Toast' }],
+      successConditions: [
+        { type: 'finalPath', expected: '/cart' },
+        { type: 'textPresent', expected: 'Paneer Toast' },
+      ],
+    });
+    const result = await findMatchingWorkflow(repository, intent);
+    assert.equal(result.match, true);
+  });
+
   it('does not execute playback for an ambiguous lookup result', async () => {
     const first = makeManifest(
       'order_store_receipt_flow_a',
