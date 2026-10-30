@@ -15,7 +15,8 @@
     "demo:offline": "node scripts/demo-recovery.js --offline",
     "demo:discover": "node --env-file=.env scripts/demo-discovery.js",
     "demo:discover:offline": "node scripts/demo-discovery.js --offline",
-    "fixture": "node scripts/serve-fixture.js"
+    "fixture": "node scripts/serve-fixture.js",
+ "fixture:bookstore": "node scripts/serve-bookstore.js"
   },
   "keywords": [
     "ai",
