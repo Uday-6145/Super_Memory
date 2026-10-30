@@ -248,6 +248,16 @@ References are validated everywhere they can appear (task intent, workflow schem
 
 When an intent and a separate `--inputs` file are both supplied, their values are reconciled once: conflicting, undeclared, or non-string values are rejected with an error that names the input, never its value.
 
+## Managed Workflow Memory
+
+By default, workflows live in a managed home directory (`SUPER_MEMORY_HOME`, or `~/Library/Application Support/SuperMemory` on macOS, `$XDG_DATA_HOME/super-memory` on Linux, `%APPDATA%/SuperMemory` on Windows) with `workflows/`, `backups/`, `journals/`, `config.json`, and an append-only `audit.jsonl`. An explicit `-w <repo>` always takes precedence. If a legacy `./workflows` directory exists while the managed repository is empty, the CLI warns and prints migration guidance; nothing is imported automatically.
+
+- `migrate --from <repo>` imports workflows copy-only after full schema, content-hash, and evidence validation. Collisions never overwrite and are reported; repeat imports are safe. Source and destination must be independent directories (checked after resolving symlinks).
+- **Symlink policy:** symbolic links are never imported. Any symlink inside a workflow (file, directory, internal, external, or dangling) rejects that workflow with a clear diagnostic before anything is read or copied, so link targets outside the source are never followed.
+- `backup` creates a timestamped, hash-inventoried snapshot outside the repository; promotions of managed workflows snapshot automatically first. Backup IDs are collision-resistant and claimed exclusively, so concurrent backups cannot overwrite each other.
+- `restore --from <backup>` is transactional: the backup is validated, the replacement is staged and verified beside the destination, the current repository is preserved under a unique `.pre-restore-*` name (never deleted), and the swap is verified. Failures roll back, and a crash mid-restore is recovered by the next backup/restore operation from the `.restore-transaction.json` journal. All destination-side renames are same-directory, so restores never perform a cross-filesystem rename.
+- `integrity` performs a read-only scan for schema, hash, evidence, and pointer inconsistencies.
+
 ## Local Fixtures
 
 Two deterministic local websites are included for development and testing. Both bind to loopback only and keep state in memory.

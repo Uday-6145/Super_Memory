@@ -63,6 +63,7 @@ import {
   HOME_ENV_VAR,
 } from '../config/home.js';
 import { appendAuditEvent } from '../config/audit.js';
+import { createRepositoryBackup, restoreRepositoryBackup } from '../config/backup.js';
 import { migrateRepository } from '../workflow/migration.js';
 import { scanRepositoryIntegrity } from '../workflow/integrity.js';
 
@@ -927,6 +928,17 @@ export class OperatorCLI {
       return { promoted: false, reason: 'cancelled' };
     }
 
+    // Managed repositories are snapshotted before every promotion so a
+    // promotion is never a point of no return. Failure to snapshot aborts
+    // the promotion before anything changes.
+    if (this._isManagedRepository()) {
+      try {
+        await createRepositoryBackup({ workflowsDir: this.repo.baseDir, backupsDir: this.homePaths.backups });
+      } catch (err) {
+        throw new WorkflowError(`Pre-promotion backup failed; promotion aborted: ${err.message}`);
+      }
+    }
+
     // Atomic promotion through validated repository lifecycle
     const promotionResult = await this.repo.markVerified(workflowId, draftVersion.version, evidence);
     await this._audit({
@@ -991,6 +1003,53 @@ export class OperatorCLI {
     }
     this.write(`Import complete: ${report.imported.length} imported, ${report.skipped.length} skipped.`);
     return report;
+  }
+
+  /**
+   * Creates a timestamped backup snapshot of the active repository in the
+   * managed home backups directory.
+   */
+  async createBackup() {
+    await ensureSuperMemoryHome({ home: this.homeDir });
+    const result = await createRepositoryBackup({
+      workflowsDir: this.repo.baseDir,
+      backupsDir: this.homePaths.backups,
+    });
+    this.write(`Backup created: ${result.backupDir}`);
+    await this._audit(
+      { type: 'backup', backupId: result.backupId, destination: result.backupDir },
+      { managedOnly: false }
+    );
+    return result;
+  }
+
+  /**
+   * Restores the active repository from a validated backup snapshot.
+   * The current repository is preserved as a pre-restore snapshot.
+   *
+   * @param {string} backupDir
+   */
+  async restoreBackup(backupDir) {
+    if (!backupDir) {
+      throw new WorkflowError('restore requires --from <backup-directory>.');
+    }
+    await ensureSuperMemoryHome({ home: this.homeDir });
+    const result = await restoreRepositoryBackup({
+      backupDir,
+      workflowsDir: this.repo.baseDir,
+      backupsDir: this.homePaths.backups,
+    });
+    this.write(`Restored repository from backup "${result.backupId}".`);
+    if (result.preservedSnapshot) {
+      this.write(`Previous repository preserved at: ${result.preservedSnapshot}`);
+    }
+    await this._audit(
+      { type: 'restore', backupId: result.backupId, source: path.resolve(backupDir) },
+      { managedOnly: false }
+    );
+    // The repository object must re-read the replaced directory.
+    this.repo = new FileSystemWorkflowRepository({ baseDir: this.repo.baseDir });
+    return result;
   }
 
   /**
@@ -1620,6 +1679,18 @@ export class OperatorCLI {
           await this.migrateRepository(values.from);
           return 0;
 
+        case 'backup':
+          await this.createBackup();
+          return 0;
+
+        case 'restore':
+          if (!values.from) {
+            this.writeErr('Error: Missing required option --from <backup-directory> for "restore".');
+            return 1;
+          }
+          await this.restoreBackup(values.from);
+          return 0;
+
         case 'integrity':
         case 'verify':
           return (await this.integrityScan()).ok ? 0 : 1;
@@ -1732,6 +1803,8 @@ Commands:
   discover [taskOrIntent]       Discover and synthesize a new workflow or reuse matching workflow
                               (plain text needs --origin and a real model provider; --intent is offline-safe)
   migrate --from <repo>         Import workflows from another repository (copy-only, hash-validated)
+  backup                        Create a timestamped backup snapshot of the active repository
+  restore --from <backup>       Restore the active repository from a backup snapshot
   integrity                     Read-only integrity scan of the active repository
 
 Options:
