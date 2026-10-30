@@ -680,11 +680,15 @@ export class DiscoveryOrchestrator {
 
         actionResult.durationMs = Math.round(performance.now() - actStartTime);
 
-        // Record trace entry
+        // Record trace entry. preObservation is the sanitized observation the
+        // decision was grounded in; postObservation is attached after the
+        // action settles. Candidate conversion pairs them to prove action
+        // effects before persisting any step verification.
         trace.push({
           stepIndex,
           decision,
           observedElement,
+          preObservation: observation,
           result: actionResult,
           ...(consequentialApproval ? { approval: consequentialApproval } : {}),
         });

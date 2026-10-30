@@ -66,6 +66,8 @@ describe('Discovery Engine — Candidate Conversion', () => {
           tag: 'button',
           type: 'submit',
         },
+        preObservation: { url: 'http://127.0.0.1:8080/store', title: 'Store', text: 'Catalog Submit Order' },
+        postObservation: { url: 'http://127.0.0.1:8080/complete', title: 'Done', text: 'Order Placed' },
         result: { ok: true, status: 200, durationMs: 65 },
       },
     ];
@@ -171,6 +173,157 @@ describe('Discovery Engine — Candidate Conversion', () => {
       finalObservation: { url: 'http://127.0.0.1:8080/complete', text: 'Done' },
     });
     assert.equal(candidate.schemaVersion, '1.0.0');
+  });
+
+  describe('Step verification filtering (Option A)', () => {
+    function filterIntent(successConditions) {
+      return createTaskIntent({
+        taskId: 't_filter',
+        objective: 'Search for the requested book and add it',
+        targetOrigin: 'http://127.0.0.1:8081',
+        startPath: '/catalog',
+        parameters: [{ name: 'book_title', value: 'Practical JavaScript Handbook', label: 'Book title' }],
+        successConditions: successConditions || [
+          { type: 'finalPath', expected: '/basket' },
+          { type: 'textPresent', input: 'book_title' },
+        ],
+      });
+    }
+
+    function entry(decision, { pre, post, element } = {}) {
+      return {
+        stepIndex: 0,
+        decision,
+        observedElement: element || { role: 'button', name: 'Go', tag: 'button', type: 'submit' },
+        ...(pre ? { preObservation: pre } : {}),
+        ...(post ? { postObservation: post } : {}),
+        result: { ok: true, status: 200, durationMs: 10 },
+      };
+    }
+
+    const catalogObs = {
+      url: 'http://127.0.0.1:8081/catalog',
+      title: 'City Books Catalog',
+      text: 'City Books Catalog Book title Find books Practical JavaScript Handbook',
+    };
+
+    it('always drops a model-generated expects predicate on fillByLabel (bookstore regression)', () => {
+      const trace = [
+        entry(
+          {
+            action: 'fillByLabel',
+            label: 'Book title',
+            inputName: 'book_title',
+            rationale: 'Enter title',
+            expects: { type: 'textPresent', expected: 'Find books' },
+          },
+          {
+            pre: catalogObs,
+            post: catalogObs,
+            element: { role: 'textbox', name: '', tag: 'input', type: 'text' },
+          }
+        ),
+        entry(
+          { action: 'clickByRole', role: 'button', name: 'Find books', rationale: 'Search' },
+          { pre: catalogObs, post: { url: 'http://127.0.0.1:8081/results', title: 'Search Results', text: 'Search Results Add to basket' } }
+        ),
+      ];
+
+      const { candidate } = buildCandidateFromTrace({
+        trace,
+        intent: filterIntent(),
+        finalObservation: { url: 'http://127.0.0.1:8081/results', text: 'Search Results' },
+      });
+
+      assert.equal(candidate.steps[0].verification, null, 'fill step must not carry the Find books predicate');
+      // Parameter-bound overall success criteria are untouched by filtering.
+      assert.equal(candidate.schemaVersion, '1.1.0');
+      assert.deepEqual(candidate.successCriteria, {
+        finalPath: '/basket',
+        textPresent: { input: 'book_title' },
+      });
+    });
+
+    it('retains click text that is absent before and present after the action', () => {
+      const trace = [
+        entry(
+          { action: 'clickByRole', role: 'button', name: 'Find books', expects: { type: 'textPresent', expected: 'Search Results' } },
+          {
+            pre: catalogObs,
+            post: { url: 'http://127.0.0.1:8081/results', title: 'Search Results', text: 'Search Results Add to basket' },
+          }
+        ),
+      ];
+      const { candidate } = buildCandidateFromTrace({
+        trace,
+        intent: filterIntent([{ type: 'finalPath', expected: '/results' }]),
+        finalObservation: { url: 'http://127.0.0.1:8081/results', text: 'Search Results' },
+      });
+      assert.deepEqual(candidate.steps[0].verification, { type: 'textPresent', expected: 'Search Results' });
+    });
+
+    it('drops click text that was already present before the action', () => {
+      const trace = [
+        entry(
+          { action: 'clickByRole', role: 'button', name: 'Find books', expects: { type: 'textPresent', expected: 'Find books' } },
+          { pre: catalogObs, post: catalogObs }
+        ),
+      ];
+      const { candidate } = buildCandidateFromTrace({
+        trace,
+        intent: filterIntent([{ type: 'finalPath', expected: '/catalog' }]),
+        finalObservation: catalogObs,
+      });
+      assert.equal(candidate.steps[0].verification, null);
+    });
+
+    it('drops first-step expectations without a pre-action observation', () => {
+      const trace = [
+        entry(
+          { action: 'navigate', path: '/catalog', expects: { type: 'pageTitle', expected: 'City Books Catalog' } },
+          { post: catalogObs }
+        ),
+      ];
+      const { candidate } = buildCandidateFromTrace({
+        trace,
+        intent: filterIntent([{ type: 'finalPath', expected: '/catalog' }]),
+        finalObservation: catalogObs,
+      });
+      assert.equal(candidate.steps[0].verification, null);
+    });
+
+    it('drops expectations when the post-action observation is missing', () => {
+      const trace = [
+        entry(
+          { action: 'clickByRole', role: 'button', name: 'Find books', expects: { type: 'textPresent', expected: 'Search Results' } },
+          { pre: catalogObs }
+        ),
+      ];
+      const { candidate } = buildCandidateFromTrace({
+        trace,
+        intent: filterIntent([{ type: 'finalPath', expected: '/catalog' }]),
+        finalObservation: catalogObs,
+      });
+      assert.equal(candidate.steps[0].verification, null);
+    });
+
+    it('retains a genuine post-navigation pageTitle effect with paired observations', () => {
+      const trace = [
+        entry(
+          { action: 'navigate', path: '/results', expects: { type: 'pageTitle', expected: 'Search Results' } },
+          {
+            pre: catalogObs,
+            post: { url: 'http://127.0.0.1:8081/results', title: 'Search Results', text: 'Search Results' },
+          }
+        ),
+      ];
+      const { candidate } = buildCandidateFromTrace({
+        trace,
+        intent: filterIntent([{ type: 'finalPath', expected: '/results' }]),
+        finalObservation: { url: 'http://127.0.0.1:8081/results', title: 'Search Results', text: 'Search Results' },
+      });
+      assert.deepEqual(candidate.steps[0].verification, { type: 'pageTitle', expected: 'Search Results' });
+    });
   });
 
   it('buildCandidateFromTrace rejects empty trace', () => {

@@ -98,6 +98,7 @@ RULES:
 5. For "fillByLabel", specify "inputName" from the declared AVAILABLE PARAMETERS. NEVER provide a literal "value".
 6. Never target password fields, execute code, or submit irreversible payment/ordering steps without explicit instruction.
 7. Set "done": true when the objective and success conditions are fully satisfied on the current page.
+8. "expects" must describe the immediate result of THIS action only: text or a title that appears because of it. Omit "expects" entirely for "fillByLabel". Never use text that merely happens to be visible on the page or that belongs to an unrelated element.
 
 JSON SCHEMA:
 {

@@ -30,6 +30,26 @@ export class CandidateConversionError extends WorkflowError {
  * @param {string} [taskId]
  * @returns {string}
  */
+/**
+ * Evaluates a step predicate against one observation. Unknown predicate
+ * types never evaluate to true.
+ */
+function evaluateStepPredicate(observation, expects) {
+  if (!observation || !expects || typeof expects.expected !== 'string') {
+    return false;
+  }
+  if (expects.type === 'textPresent') {
+    return (observation.text || '').includes(expects.expected);
+  }
+  if (expects.type === 'pageTitle') {
+    return (observation.title || '').includes(expects.expected);
+  }
+  if (expects.type === 'textAbsent') {
+    return !(observation.text || '').includes(expects.expected);
+  }
+  return false;
+}
+
 export function generateWorkflowIdSlug(objective, taskId) {
   let slug = (objective || '')
     .toLowerCase()
@@ -133,21 +153,32 @@ export function buildCandidateFromTrace({ trace, intent, finalObservation }) {
       }
     }
 
-    // Step verification predicate: only persist if confirmed against post-action observation
+    // Step verification filtering (host-side and deterministic; model
+    // instructions are not enforcement):
+    // - fillByLabel never carries a step verification. A completed fill is
+    //   the signal; its outcome is proven by later actions and the overall
+    //   success criteria.
+    // - clickByRole/navigate keep a predicate only as a proven effect of
+    //   THIS action execution: satisfied by the immediate post-action
+    //   observation and not satisfied by the immediate pre-action
+    //   observation of the same execution. If either observation is
+    //   unavailable, the predicate is dropped. Text that merely happens to
+    //   be visible on the page is never treated as an action effect.
     let stepVerification = null;
-    if (decision.expects && typeof decision.expects === 'object') {
-      const postObs = entry.postObservation || finalObservation;
-      let confirmed = true;
-      if (postObs) {
-        if (decision.expects.type === 'textPresent') {
-          confirmed = (postObs.text || '').includes(decision.expects.expected);
-        } else if (decision.expects.type === 'pageTitle') {
-          confirmed = (postObs.title || '').includes(decision.expects.expected);
-        } else if (decision.expects.type === 'textAbsent') {
-          confirmed = !(postObs.text || '').includes(decision.expects.expected);
-        }
-      }
-      if (confirmed) {
+    if (
+      decision.action !== 'fillByLabel' &&
+      decision.expects &&
+      typeof decision.expects === 'object' &&
+      typeof decision.expects.expected === 'string'
+    ) {
+      const postObs = entry.postObservation;
+      const preObs = entry.preObservation;
+      if (
+        postObs &&
+        preObs &&
+        evaluateStepPredicate(postObs, decision.expects) &&
+        !evaluateStepPredicate(preObs, decision.expects)
+      ) {
         stepVerification = {
           type: decision.expects.type,
           expected: decision.expects.expected,
