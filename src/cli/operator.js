@@ -21,7 +21,6 @@
  * - Promotion preserves disabled state without silently enabling
  */
 
-import http from 'node:http';
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
@@ -31,7 +30,6 @@ import { parseArgs } from 'node:util';
 import {
   FileSystemWorkflowRepository,
   WorkflowPlayer,
-  validateRuntimeInputs,
   calculateContentHash,
   validateVerificationEvidence,
   verifyEvidenceMatchesWorkflow,
@@ -68,92 +66,14 @@ import {
   renderDiff,
 } from '../services/workflow-query.js';
 import { createMaintenanceService } from '../services/maintenance.js';
+import {
+  createExecutionService,
+  ensureLocalFixtureIfTargeted,
+  getStagedEvidencePath,
+  loadInputs,
+} from '../services/execution.js';
 
-export { renderDiff };
-
-/**
- * Returns the default staging path for trial verification evidence.
- * Placed inside `<baseDir>/.staging/` so repository version scanners ignore it.
- *
- * @param {string} baseDir
- * @param {string} workflowId
- * @param {number} draftVersion
- * @returns {string}
- */
-export function getStagedEvidencePath(baseDir, workflowId, draftVersion) {
-  return path.join(path.resolve(baseDir), '.staging', `${workflowId}-draft-${draftVersion}.evidence.json`);
-}
-
-/**
- * Ensures the local synthetic fixture server is running if the target origin is on port 8080.
- *
- * @param {string} targetOrigin
- * @returns {Promise<import('node:http').Server|null>}
- */
-async function ensureLocalFixtureIfTargeted(targetOrigin) {
-  if (!targetOrigin) return null;
-  try {
-    const url = new URL(targetOrigin);
-    if ((url.hostname === '127.0.0.1' || url.hostname === 'localhost') && (url.port === '8080' || !url.port)) {
-      const isListening = await new Promise((resolve) => {
-        const req = http.get('http://127.0.0.1:8080/store', { timeout: 300 }, (res) => {
-          res.resume();
-          resolve(true);
-        });
-        req.on('error', () => resolve(false));
-        req.on('timeout', () => {
-          req.destroy();
-          resolve(false);
-        });
-      });
-
-      if (!isListening) {
-        const { startFixtureServer } = await import('../../scripts/serve-fixture.js');
-        return await startFixtureServer(8080);
-      }
-    }
-  } catch {}
-  return null;
-}
-
-/**
- * Reads and validates a JSON inputs file without echoing its contents or secrets.
- *
- * @param {string} inputsPath
- * @returns {Promise<Record<string, string>>}
- */
-export async function loadInputs(inputsPath) {
-  if (!inputsPath) return {};
-  const resolved = path.resolve(inputsPath);
-  let content;
-  try {
-    content = await fs.readFile(resolved, 'utf8');
-  } catch (err) {
-    if (err.code === 'ENOENT') {
-      throw new WorkflowError(`Inputs file not found: "${inputsPath}".`);
-    }
-    throw new WorkflowError(`Failed to read inputs file "${inputsPath}": ${err.message}`);
-  }
-
-  let parsed;
-  try {
-    parsed = JSON.parse(content);
-  } catch (err) {
-    throw new WorkflowError(`Invalid JSON in inputs file "${inputsPath}": ${err.message}`);
-  }
-
-  if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
-    throw new WorkflowError(`Inputs file "${inputsPath}" must contain a JSON object mapping input names to string values.`);
-  }
-
-  for (const [key, val] of Object.entries(parsed)) {
-    if (typeof val !== 'string') {
-      throw new WorkflowError(`Input "${key}" must be a string value (received ${typeof val}).`);
-    }
-  }
-
-  return parsed;
-}
+export { renderDiff, getStagedEvidencePath, loadInputs };
 
 /**
  * Collects known sensitive values for output redaction from runtime input
@@ -363,6 +283,20 @@ export class OperatorCLI {
     });
   }
 
+  /**
+   * Builds a workflow execution service bound to the current context.
+   * Per-call construction keeps the repository and flag resolution aligned
+   * with the live CLI instance.
+   */
+  _executionService({ allowLocalhost, headless } = {}) {
+    return createExecutionService({
+      repository: this.repo,
+      browserRuntime: this.browserRuntime,
+      allowLocalhost: allowLocalhost ?? this.allowLocalhost,
+      headless: headless ?? this.headless,
+    });
+  }
+
   write(msg = '') {
     if (this.stdout && typeof this.stdout.write === 'function') {
       this.stdout.write(msg + '\n');
@@ -529,38 +463,22 @@ export class OperatorCLI {
       throw new WorkflowError('Missing workflow ID for trial command.');
     }
 
-    const manifest = await this.repo.getManifest(workflowId);
-    if (!manifest) {
-      throw new WorkflowNotFoundError(`Workflow "${workflowId}" not found in repository.`, { workflowId });
-    }
-
-    if (!manifest.draftVersion) {
-      throw new WorkflowError(`Workflow "${workflowId}" has no draft version for verification.`);
-    }
-
-    const draftVersion = await this.repo.getVersion(workflowId, manifest.draftVersion);
-    if (!draftVersion) {
-      throw new WorkflowNotFoundError(
-        `Draft version ${manifest.draftVersion} for workflow "${workflowId}" not found on disk.`,
-        { workflowId, version: manifest.draftVersion }
-      );
-    }
-
     const inputs = directInputs || (await loadInputs(inputsPath));
     const secrets = deriveSecrets(inputs);
 
-    // Validate inputs against draft declarations early
-    validateRuntimeInputs(draftVersion.inputs || [], inputs, workflowId);
-
-    const isLocalhostAllowed = allowLocalhost ?? this.allowLocalhost;
-    const isHeadless = headless ?? this.headless;
-
-    const player = new WorkflowPlayer({
-      repository: this.repo,
-      browserRuntime: this.browserRuntime,
-      allowLocalhost: isLocalhostAllowed,
-      headless: isHeadless,
-    });
+    // Header data comes from the read-only query service; validation and
+    // execution live in the execution service.
+    const inspected = await this._queryService().inspectWorkflow(workflowId);
+    const draftVersion = inspected.draftVersion;
+    if (!inspected.manifest.draftVersion) {
+      throw new WorkflowError(`Workflow "${workflowId}" has no draft version for verification.`);
+    }
+    if (!draftVersion) {
+      throw new WorkflowNotFoundError(
+        `Draft version ${inspected.manifest.draftVersion} for workflow "${workflowId}" not found on disk.`,
+        { workflowId, version: inspected.manifest.draftVersion }
+      );
+    }
 
     this.write('================================================================================');
     this.write(`TRIAL DRAFT EXECUTION: ${workflowId} (Draft v${draftVersion.version})`);
@@ -569,24 +487,12 @@ export class OperatorCLI {
     this.write(`Parent Version: v${draftVersion.parentVersion || 'none'}`);
     this.write('\nExecuting steps...');
 
-    let autoFixtureServer = null;
-    if (isLocalhostAllowed) {
-      autoFixtureServer = await ensureLocalFixtureIfTargeted(draftVersion.target?.origin);
-    }
-
-    let trialResult;
-    try {
-      trialResult = await player.playDraftForVerification(workflowId, inputs, {
-        allowLocalhost: isLocalhostAllowed,
-      });
-    } finally {
-      if (!this.browserRuntime) {
-        await player.close();
-      }
-      if (autoFixtureServer) {
-        await new Promise((res) => autoFixtureServer.close(res)).catch(() => {});
-      }
-    }
+    const outcome = await this._executionService({ allowLocalhost, headless }).trialDraft({
+      workflowId,
+      inputs,
+      evidenceOut,
+    });
+    const trialResult = outcome.trialResult;
 
     // Display sanitized step results
     for (const sr of trialResult.runResult.stepResults || []) {
@@ -611,12 +517,8 @@ export class OperatorCLI {
       this.write(`Run ID:        ${trialResult.evidence.runId}`);
       this.write(`Verified At:   ${trialResult.evidence.verifiedAt}`);
 
-      // Save staged evidence
-      const targetPath = evidenceOut ? path.resolve(evidenceOut) : getStagedEvidencePath(this.repo.baseDir, workflowId, draftVersion.version);
-      await fs.mkdir(path.dirname(targetPath), { recursive: true });
-      await fs.writeFile(targetPath, JSON.stringify(trialResult.evidence, null, 2), 'utf8');
-
-      this.write(`\nEvidence saved to: ${targetPath}`);
+      // Staging was performed by the execution service (success path only).
+      this.write(`\nEvidence saved to: ${outcome.evidencePath}`);
       this.write('\nIMPORTANT: This draft has NOT been promoted.');
       this.write('Ordinary playback continues executing active verified version.');
       this.write(`To explicitly promote, run:\n  node scripts/super-memory.js promote ${workflowId}`);
@@ -625,19 +527,13 @@ export class OperatorCLI {
       return {
         success: true,
         trialResult,
-        evidencePath: targetPath,
+        evidencePath: outcome.evidencePath,
       };
     } else {
       this.write('TRIAL VERDICT: FAILED (Not Ready For Promotion)');
       this.write('Draft remains unverified. Failed trials cannot produce valid promotion evidence.');
-
-      // Clean up only the CLI-owned internal staged evidence file in .staging
-      // so a failed run cannot leave stale staged evidence eligible for promotion.
-      // Never delete a caller-owned or user-specified custom evidenceOut file.
-      const defaultStagedPath = getStagedEvidencePath(this.repo.baseDir, workflowId, draftVersion.version);
-      try {
-        await fs.unlink(defaultStagedPath);
-      } catch {}
+      // Stale staged-evidence cleanup was performed by the execution
+      // service; a caller-owned evidenceOut file is never touched.
 
       this.write('================================================================================');
       return {
@@ -900,44 +796,15 @@ export class OperatorCLI {
 
     const inputs = directInputs || (await loadInputs(inputsPath));
     const secrets = deriveSecrets(inputs);
-    const isLocalhostAllowed = allowLocalhost ?? this.allowLocalhost;
-    const isHeadless = headless ?? this.headless;
 
-    const player = new WorkflowPlayer({
-      repository: this.repo,
-      browserRuntime: this.browserRuntime,
-      allowLocalhost: isLocalhostAllowed,
-      headless: isHeadless,
-    });
-
-    let autoFixtureServer = null;
-    if (isLocalhostAllowed) {
-      try {
-        const manifest = await this.repo.getManifest(workflowId);
-        if (manifest?.activeVersion) {
-          const activeVer = await this.repo.getVersion(workflowId, manifest.activeVersion);
-          autoFixtureServer = await ensureLocalFixtureIfTargeted(activeVer?.target?.origin);
-        }
-      } catch {}
+    this.write(`Executing active verified version for workflow "${workflowId}"...`);
+    const result = await this._executionService({ allowLocalhost, headless }).playWorkflow({ workflowId, inputs });
+    if (result.ok) {
+      this.write(`Playback succeeded! Active version v${result.version} finished in ${result.durationMs}ms.`);
+    } else {
+      this.write(`Playback failed: active version v${result.version} encountered an error: ${redactSecrets(result.error, secrets)}`);
     }
-
-    try {
-      this.write(`Executing active verified version for workflow "${workflowId}"...`);
-      const result = await player.play(workflowId, inputs, { allowLocalhost: isLocalhostAllowed });
-      if (result.ok) {
-        this.write(`Playback succeeded! Active version v${result.version} finished in ${result.durationMs}ms.`);
-      } else {
-        this.write(`Playback failed: active version v${result.version} encountered an error: ${redactSecrets(result.error, secrets)}`);
-      }
-      return result;
-    } finally {
-      if (!this.browserRuntime) {
-        await player.close();
-      }
-      if (autoFixtureServer) {
-        await new Promise((res) => autoFixtureServer.close(res)).catch(() => {});
-      }
-    }
+    return result;
   }
 
   /**
