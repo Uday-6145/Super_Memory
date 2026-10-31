@@ -63,12 +63,11 @@ import {
   HOME_ENV_VAR,
 } from '../config/home.js';
 import { appendAuditEvent } from '../config/audit.js';
-import { createRepositoryBackup, restoreRepositoryBackup } from '../config/backup.js';
-import { migrateRepository } from '../workflow/migration.js';
 import {
   createWorkflowQueryService,
   renderDiff,
 } from '../services/workflow-query.js';
+import { createMaintenanceService } from '../services/maintenance.js';
 
 export { renderDiff };
 
@@ -347,6 +346,21 @@ export class OperatorCLI {
    */
   _queryService() {
     return createWorkflowQueryService({ repository: this.repo });
+  }
+
+  /**
+   * Builds a repository maintenance service bound to the current context.
+   * Created per call so operations that replace `this.repo` (restore) can
+   * never observe a stale repository handle.
+   */
+  _maintenanceService() {
+    return createMaintenanceService({
+      repository: this.repo,
+      backupsDir: this.homePaths.backups,
+      isManaged: this._isManagedRepository(),
+      audit: (event, options) => this._audit(event, options),
+      ensureHome: () => ensureSuperMemoryHome({ home: this.homeDir }),
+    });
   }
 
   write(msg = '') {
@@ -765,13 +779,7 @@ export class OperatorCLI {
     // Managed repositories are snapshotted before every promotion so a
     // promotion is never a point of no return. Failure to snapshot aborts
     // the promotion before anything changes.
-    if (this._isManagedRepository()) {
-      try {
-        await createRepositoryBackup({ workflowsDir: this.repo.baseDir, backupsDir: this.homePaths.backups });
-      } catch (err) {
-        throw new WorkflowError(`Pre-promotion backup failed; promotion aborted: ${err.message}`);
-      }
-    }
+    await this._maintenanceService().snapshotBeforePromotion();
 
     // Atomic promotion through validated repository lifecycle
     const promotionResult = await this.repo.markVerified(workflowId, draftVersion.version, evidence);
@@ -816,21 +824,10 @@ export class OperatorCLI {
     if (!sourceDir) {
       throw new WorkflowError('migrate requires --from <source-repository>.');
     }
-    if (this._isManagedRepository()) {
-      await ensureSuperMemoryHome({ home: this.homeDir });
-    }
     this.write(`Importing workflows from "${path.resolve(sourceDir)}" into "${this.repo.baseDir}"...`);
-    const report = await migrateRepository({ sourceDir, destinationDir: this.repo.baseDir });
+    const report = await this._maintenanceService().migrateRepository(sourceDir);
     for (const item of report.imported) {
       this.write(`  Imported: ${item.workflowId} (versions: ${item.versions.join(', ')})`);
-      await this._audit({
-        type: 'import',
-        workflowId: item.workflowId,
-        version: item.versions[item.versions.length - 1],
-        contentHash: item.contentHashes[item.versions[item.versions.length - 1]],
-        source: path.resolve(sourceDir),
-        imported: item.versions.length,
-      });
     }
     for (const item of report.skipped) {
       this.write(`  Skipped: ${item.workflowId} (${item.reason})`);
@@ -844,16 +841,8 @@ export class OperatorCLI {
    * managed home backups directory.
    */
   async createBackup() {
-    await ensureSuperMemoryHome({ home: this.homeDir });
-    const result = await createRepositoryBackup({
-      workflowsDir: this.repo.baseDir,
-      backupsDir: this.homePaths.backups,
-    });
+    const result = await this._maintenanceService().createBackup();
     this.write(`Backup created: ${result.backupDir}`);
-    await this._audit(
-      { type: 'backup', backupId: result.backupId, destination: result.backupDir },
-      { managedOnly: false }
-    );
     return result;
   }
 
@@ -867,23 +856,15 @@ export class OperatorCLI {
     if (!backupDir) {
       throw new WorkflowError('restore requires --from <backup-directory>.');
     }
-    await ensureSuperMemoryHome({ home: this.homeDir });
-    const result = await restoreRepositoryBackup({
-      backupDir,
-      workflowsDir: this.repo.baseDir,
-      backupsDir: this.homePaths.backups,
-    });
+    const result = await this._maintenanceService().restoreBackup(backupDir);
     this.write(`Restored repository from backup "${result.backupId}".`);
     if (result.preservedSnapshot) {
       this.write(`Previous repository preserved at: ${result.preservedSnapshot}`);
     }
-    await this._audit(
-      { type: 'restore', backupId: result.backupId, source: path.resolve(backupDir) },
-      { managedOnly: false }
-    );
-    // The repository object must re-read the replaced directory.
-    this.repo = new FileSystemWorkflowRepository({ baseDir: this.repo.baseDir });
-    return result;
+    // Adopt the fresh repository handle: the replaced directory must be
+    // re-read, and no stale handle may be retained.
+    this.repo = result.repository;
+    return { backupId: result.backupId, preservedSnapshot: result.preservedSnapshot };
   }
 
   /**
