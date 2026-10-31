@@ -65,7 +65,12 @@ import {
 import { appendAuditEvent } from '../config/audit.js';
 import { createRepositoryBackup, restoreRepositoryBackup } from '../config/backup.js';
 import { migrateRepository } from '../workflow/migration.js';
-import { scanRepositoryIntegrity } from '../workflow/integrity.js';
+import {
+  createWorkflowQueryService,
+  renderDiff,
+} from '../services/workflow-query.js';
+
+export { renderDiff };
 
 /**
  * Returns the default staging path for trial verification evidence.
@@ -256,166 +261,9 @@ export function formatTable(headers, rows) {
   return [headerLine, separatorLine, ...dataLines].join('\n');
 }
 
-/**
- * Compares an active version and a draft version and produces a human-readable,
- * secret-safe diff identifying exact step, target, input, and success criteria changes.
- *
- * @param {object|null} activeVersion
- * @param {object} draftVersion
- * @param {object} [options]
- * @param {string[]} [options.secrets]
- * @returns {string}
- */
-export function renderDiff(activeVersion, draftVersion, { secrets = [] } = {}) {
-  const out = [];
-
-  out.push('================================================================================');
-  out.push(`REPAIR PROPOSAL REVIEW: ${draftVersion.workflowId}`);
-  out.push('================================================================================');
-  out.push(`Draft Version:   v${draftVersion.version}`);
-  out.push(`Parent Version:  ${draftVersion.parentVersion ? `v${draftVersion.parentVersion}` : 'none'}`);
-  out.push(`Active Version:  ${activeVersion ? `v${activeVersion.version}` : 'none (draft-only)'}`);
-  out.push(`Change Summary:  ${redactSecrets(draftVersion.changeSummary || '(no summary provided)', secrets)}`);
-
-  let draftHash = 'unknown';
-  let activeHash = null;
-  try {
-    draftHash = calculateContentHash(draftVersion);
-  } catch {}
-  if (activeVersion) {
-    try {
-      activeHash = calculateContentHash(activeVersion);
-    } catch {}
-  }
-  out.push(`Content Hash:    ${activeHash ? `${activeHash.slice(0, 16)}... -> ` : ''}${draftHash.slice(0, 16)}...`);
-
-  if (!activeVersion) {
-    out.push('\n--- Initial Draft Version (No parent active version to diff against) ---');
-    for (const step of draftVersion.steps || []) {
-      const stepId = redactSecrets(step.id || '', secrets);
-      const stepParams = redactSecrets(JSON.stringify(step.params || {}), secrets);
-      const stepDesc = step.description ? ` (${redactSecrets(step.description, secrets)})` : '';
-      out.push(`  [Added Step ${step.order}] ${step.action} (${stepId})${stepDesc}: ${stepParams}`);
-    }
-    out.push('================================================================================');
-    return out.join('\n');
-  }
-
-  // 1. Step Changes
-  out.push('\n--- Step Changes ---');
-  const activeSteps = activeVersion.steps || [];
-  const draftSteps = draftVersion.steps || [];
-  const maxSteps = Math.max(activeSteps.length, draftSteps.length);
-
-  let hasStepChanges = false;
-  for (let i = 0; i < maxSteps; i++) {
-    const a = activeSteps[i];
-    const d = draftSteps[i];
-
-    if (a && d) {
-      const aJson = JSON.stringify({ action: a.action, description: a.description, params: a.params, verification: a.verification });
-      const dJson = JSON.stringify({ action: d.action, description: d.description, params: d.params, verification: d.verification });
-
-      if (aJson === dJson && a.id === d.id) {
-        const dId = redactSecrets(d.id || '', secrets);
-        const dParams = formatStepParams(d.params, secrets);
-        out.push(`  [Unchanged] Step ${d.order} (${dId}): ${d.action} ${dParams}`);
-      } else {
-        hasStepChanges = true;
-        const dId = redactSecrets(d.id || '', secrets);
-        out.push(`  [Modified]  Step ${d.order} (${dId}):`);
-        if (a.action !== d.action) {
-          out.push(`    - action: ${a.action}`);
-          out.push(`    + action: ${d.action}`);
-        }
-        if (a.description !== d.description) {
-          out.push(`    - description: ${redactSecrets(a.description || '', secrets)}`);
-          out.push(`    + description: ${redactSecrets(d.description || '', secrets)}`);
-        }
-        if (JSON.stringify(a.params) !== JSON.stringify(d.params)) {
-          out.push(`    - target: ${redactSecrets(JSON.stringify(a.params || {}), secrets)}`);
-          out.push(`    + target: ${redactSecrets(JSON.stringify(d.params || {}), secrets)}`);
-        }
-        if (JSON.stringify(a.verification) !== JSON.stringify(d.verification)) {
-          out.push(`    - verification: ${redactSecrets(JSON.stringify(a.verification || null), secrets)}`);
-          out.push(`    + verification: ${redactSecrets(JSON.stringify(d.verification || null), secrets)}`);
-        }
-      }
-    } else if (!a && d) {
-      hasStepChanges = true;
-      const dId = redactSecrets(d.id || '', secrets);
-      const dParams = redactSecrets(JSON.stringify(d.params || {}), secrets);
-      out.push(`  [Added]     Step ${d.order} (${dId}): ${d.action} ${dParams}`);
-      if (d.description) {
-        out.push(`              description: ${redactSecrets(d.description, secrets)}`);
-      }
-      if (d.verification) {
-        out.push(`              verification: ${redactSecrets(JSON.stringify(d.verification), secrets)}`);
-      }
-    } else if (a && !d) {
-      hasStepChanges = true;
-      const aId = redactSecrets(a.id || '', secrets);
-      const aParams = redactSecrets(JSON.stringify(a.params || {}), secrets);
-      out.push(`  [Removed]   Step ${a.order} (${aId}): ${a.action} ${aParams}`);
-      if (a.description) {
-        out.push(`              description: ${redactSecrets(a.description, secrets)}`);
-      }
-      if (a.verification) {
-        out.push(`              verification: ${redactSecrets(JSON.stringify(a.verification), secrets)}`);
-      }
-    }
-  }
-
-  if (!hasStepChanges && activeSteps.length === draftSteps.length) {
-    out.push('  (No step differences detected)');
-  }
-
-  // 2. Target Changes
-  out.push('\n--- Target Changes ---');
-  const aTarget = activeVersion.target || {};
-  const dTarget = draftVersion.target || {};
-  let targetChanged = false;
-  if (aTarget.origin !== dTarget.origin) {
-    targetChanged = true;
-    out.push(`  - origin: ${redactSecrets(aTarget.origin || '', secrets)}`);
-    out.push(`  + origin: ${redactSecrets(dTarget.origin || '', secrets)}`);
-  }
-  if (aTarget.startPath !== dTarget.startPath) {
-    targetChanged = true;
-    out.push(`  - startPath: ${redactSecrets(aTarget.startPath || '', secrets)}`);
-    out.push(`  + startPath: ${redactSecrets(dTarget.startPath || '', secrets)}`);
-  }
-  if (!targetChanged) {
-    out.push('  (No target changes)');
-  }
-
-  // 3. Input Declaration Changes
-  out.push('\n--- Input Changes ---');
-  const aInputs = JSON.stringify(activeVersion.inputs || []);
-  const dInputs = JSON.stringify(draftVersion.inputs || []);
-  if (aInputs !== dInputs) {
-    out.push(`  - inputs: ${redactSecrets(aInputs, secrets)}`);
-    out.push(`  + inputs: ${redactSecrets(dInputs, secrets)}`);
-  } else {
-    out.push('  (No input declaration changes)');
-  }
-
-  // 4. Success Criteria Changes
-  out.push('\n--- Success Criteria Changes ---');
-  const aSC = JSON.stringify(activeVersion.successCriteria || {});
-  const dSC = JSON.stringify(draftVersion.successCriteria || {});
-  if (aSC !== dSC) {
-    out.push(`  - criteria: ${redactSecrets(aSC, secrets)}`);
-    out.push(`  + criteria: ${redactSecrets(dSC, secrets)}`);
-  } else {
-    out.push('  (No success criteria changes)');
-  }
-
-  out.push('\nStatus: UNAPPROVED DRAFT (Untrusted until trialed and explicitly promoted)');
-  out.push('================================================================================');
-
-  return out.join('\n');
-}
+// Secret-safe repair-proposal diff rendering moved to the read-only workflow
+// query service (`src/services/workflow-query.js`); re-exported at the top of
+// this module to preserve the existing import surface.
 
 function formatStepParams(params, secrets = []) {
   if (!params || typeof params !== 'object') return '';
@@ -491,6 +339,16 @@ export class OperatorCLI {
     } catch {}
   }
 
+  /**
+   * Builds a read-only workflow query service bound to the current
+   * repository. Created per call so operations that replace `this.repo`
+   * (explicit `--workflows-dir`, post-restore re-read) can never observe a
+   * stale repository handle.
+   */
+  _queryService() {
+    return createWorkflowQueryService({ repository: this.repo });
+  }
+
   write(msg = '') {
     if (this.stdout && typeof this.stdout.write === 'function') {
       this.stdout.write(msg + '\n');
@@ -507,7 +365,7 @@ export class OperatorCLI {
    * Capability A: List workflows
    */
   async list({ enabledOnly = false } = {}) {
-    const workflows = await this.repo.list({ enabledOnly });
+    const workflows = await this._queryService().listWorkflows({ enabledOnly });
     if (!workflows || workflows.length === 0) {
       this.write(`No workflows found in repository (${this.workflowsDir}).`);
       return [];
@@ -549,10 +407,8 @@ export class OperatorCLI {
       } catch {}
     }
 
-    const manifest = await this.repo.getManifest(workflowId);
-    if (!manifest) {
-      throw new WorkflowNotFoundError(`Workflow "${workflowId}" not found in repository.`, { workflowId });
-    }
+    const data = await this._queryService().inspectWorkflow(workflowId);
+    const manifest = data.manifest;
 
     const stepLine = (step) =>
       `    Step ${step.order}: ${step.action} [${redactSecrets(step.id || '', secrets)}] ${formatStepParams(step.params, secrets)}${step.description ? ` (${redactSecrets(step.description, secrets)})` : ''}`;
@@ -567,55 +423,50 @@ export class OperatorCLI {
     this.write(`Updated:      ${manifest.timestamps?.updatedAt || 'unknown'}`);
 
     // Active Version Details
-    if (manifest.activeVersion) {
-      const activeVer = await this.repo.getVersion(workflowId, manifest.activeVersion);
-      if (activeVer) {
-        const hash = calculateContentHash(activeVer);
-        this.write(`\n[Active Version: v${activeVer.version} (verified)]`);
-        this.write(`  Content Hash:    ${hash}`);
-        this.write(`  Target:          ${redactSecrets(activeVer.target?.origin || '', secrets)}${redactSecrets(activeVer.target?.startPath || '', secrets)}`);
-        this.write(`  Total Steps:     ${activeVer.steps?.length || 0}`);
-        for (const step of activeVer.steps || []) {
-          this.write(stepLine(step));
-        }
-        this.write(`  Success Criteria: ${redactSecrets(JSON.stringify(activeVer.successCriteria || {}), secrets)}`);
-
-        // Evidence details
-        const evidence = await this.repo.getVerificationEvidence(workflowId, activeVer.version);
-        if (evidence) {
-          this.write('  Verification Evidence:');
-          this.write(`    Verified At:   ${evidence.verifiedAt || 'unknown'}`);
-          this.write(`    Playwright:    ${evidence.environment?.playwrightVersion || 'unknown'}`);
-          this.write(`    Browser:       ${evidence.environment?.browserEngine || 'unknown'}`);
-          this.write(`    Run ID:        ${evidence.runId || 'unknown'}`);
-        }
+    if (data.activeVersion) {
+      const activeVer = data.activeVersion;
+      const hash = data.activeHash;
+      this.write(`\n[Active Version: v${activeVer.version} (verified)]`);
+      this.write(`  Content Hash:    ${hash}`);
+      this.write(`  Target:          ${redactSecrets(activeVer.target?.origin || '', secrets)}${redactSecrets(activeVer.target?.startPath || '', secrets)}`);
+      this.write(`  Total Steps:     ${activeVer.steps?.length || 0}`);
+      for (const step of activeVer.steps || []) {
+        this.write(stepLine(step));
       }
-    } else {
+      this.write(`  Success Criteria: ${redactSecrets(JSON.stringify(activeVer.successCriteria || {}), secrets)}`);
+
+      // Evidence details
+      const evidence = data.activeEvidence;
+      if (evidence) {
+        this.write('  Verification Evidence:');
+        this.write(`    Verified At:   ${evidence.verifiedAt || 'unknown'}`);
+        this.write(`    Playwright:    ${evidence.environment?.playwrightVersion || 'unknown'}`);
+        this.write(`    Browser:       ${evidence.environment?.browserEngine || 'unknown'}`);
+        this.write(`    Run ID:        ${evidence.runId || 'unknown'}`);
+      }
+    } else if (!manifest.activeVersion) {
       this.write('\n[Active Version: None (Draft-only workflow)]');
     }
 
     // Draft Version Details
-    if (manifest.draftVersion) {
-      const draftVer = await this.repo.getVersion(workflowId, manifest.draftVersion);
-      if (draftVer) {
-        const draftHash = calculateContentHash(draftVer);
-        this.write(`\n[Draft Version: v${draftVer.version} (unapproved draft)] <-- PENDING OPERATOR REVIEW`);
-        this.write(`  Parent Version:  ${draftVer.parentVersion ? `v${draftVer.parentVersion}` : 'none'}`);
-        this.write(`  Content Hash:    ${draftHash}`);
-        this.write(`  Change Summary:  ${redactSecrets(draftVer.changeSummary || '(no summary)', secrets)}`);
-        this.write(`  Total Steps:     ${draftVer.steps?.length || 0}`);
-        for (const step of draftVer.steps || []) {
-          this.write(stepLine(step));
-        }
-        this.write(`  Success Criteria: ${redactSecrets(JSON.stringify(draftVer.successCriteria || {}), secrets)}`);
+    if (data.draftVersion) {
+      const draftVer = data.draftVersion;
+      const draftHash = data.draftHash;
+      this.write(`\n[Draft Version: v${draftVer.version} (unapproved draft)] <-- PENDING OPERATOR REVIEW`);
+      this.write(`  Parent Version:  ${draftVer.parentVersion ? `v${draftVer.parentVersion}` : 'none'}`);
+      this.write(`  Content Hash:    ${draftHash}`);
+      this.write(`  Change Summary:  ${redactSecrets(draftVer.changeSummary || '(no summary)', secrets)}`);
+      this.write(`  Total Steps:     ${draftVer.steps?.length || 0}`);
+      for (const step of draftVer.steps || []) {
+        this.write(stepLine(step));
       }
-    } else {
+      this.write(`  Success Criteria: ${redactSecrets(JSON.stringify(draftVer.successCriteria || {}), secrets)}`);
+    } else if (!manifest.draftVersion) {
       this.write('\n[Draft Version: None]');
     }
 
     // Declared Inputs
-    const refVersion = (manifest.activeVersion && (await this.repo.getVersion(workflowId, manifest.activeVersion))) ||
-      (manifest.draftVersion && (await this.repo.getVersion(workflowId, manifest.draftVersion)));
+    const refVersion = data.referenceVersion;
 
     if (refVersion && refVersion.inputs && refVersion.inputs.length > 0) {
       this.write('\n[Declared Inputs]');
@@ -639,28 +490,6 @@ export class OperatorCLI {
       throw new WorkflowError('Missing workflow ID for review command.');
     }
 
-    const manifest = await this.repo.getManifest(workflowId);
-    if (!manifest) {
-      throw new WorkflowNotFoundError(`Workflow "${workflowId}" not found in repository.`, { workflowId });
-    }
-
-    if (!manifest.draftVersion) {
-      this.write(`Workflow "${workflowId}" has no pending draft repair.`);
-      return null;
-    }
-
-    const draftVersion = await this.repo.getVersion(workflowId, manifest.draftVersion);
-    if (!draftVersion) {
-      throw new WorkflowNotFoundError(
-        `Draft version ${manifest.draftVersion} for workflow "${workflowId}" not found on disk.`,
-        { workflowId, version: manifest.draftVersion }
-      );
-    }
-
-    const activeVersion = manifest.activeVersion
-      ? await this.repo.getVersion(workflowId, manifest.activeVersion)
-      : null;
-
     let secrets = deriveSecrets(customSecrets, directInputs);
     if (!directInputs && inputsPath) {
       try {
@@ -668,9 +497,14 @@ export class OperatorCLI {
       } catch {}
     }
 
-    const diffText = renderDiff(activeVersion, draftVersion, { secrets });
-    this.write(diffText);
-    return { activeVersion, draftVersion, diff: diffText };
+    const result = await this._queryService().reviewDraft(workflowId, { secrets });
+    if (!result) {
+      this.write(`Workflow "${workflowId}" has no pending draft repair.`);
+      return null;
+    }
+
+    this.write(result.diff);
+    return { activeVersion: result.activeVersion, draftVersion: result.draftVersion, diff: result.diff };
   }
 
   /**
@@ -1056,7 +890,7 @@ export class OperatorCLI {
    * Runs a read-only integrity scan over the active repository.
    */
   async integrityScan() {
-    const report = await scanRepositoryIntegrity(this.repo.baseDir);
+    const report = await this._queryService().scanIntegrity();
     if (report.totals.workflows === 0) {
       this.write(`Integrity scan: repository at "${report.baseDir}" is empty.`);
       return report;
