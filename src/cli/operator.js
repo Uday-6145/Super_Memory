@@ -30,15 +30,11 @@ import { parseArgs } from 'node:util';
 import {
   FileSystemWorkflowRepository,
   WorkflowPlayer,
-  calculateContentHash,
-  validateVerificationEvidence,
-  verifyEvidenceMatchesWorkflow,
   collectFailureDiagnostic,
   generateRepairProposal,
   applyRepairToDraft,
   redactSecrets,
   WorkflowError,
-  WorkflowValidationError,
   WorkflowNotFoundError,
 } from '../workflow/index.js';
 
@@ -66,6 +62,7 @@ import {
   renderDiff,
 } from '../services/workflow-query.js';
 import { createMaintenanceService } from '../services/maintenance.js';
+import { createPromotionService } from '../services/promotion.js';
 import {
   createExecutionService,
   ensureLocalFixtureIfTargeted,
@@ -288,6 +285,14 @@ export class OperatorCLI {
    * Per-call construction keeps the repository and flag resolution aligned
    * with the live CLI instance.
    */
+  _promotionService() {
+    return createPromotionService({
+      repository: this.repo,
+      maintenance: this._maintenanceService(),
+      audit: (event, options) => this._audit(event, options),
+    });
+  }
+
   _executionService({ allowLocalhost, headless } = {}) {
     return createExecutionService({
       repository: this.repo,
@@ -551,71 +556,14 @@ export class OperatorCLI {
       throw new WorkflowError('Missing workflow ID for promote command.');
     }
 
-    const manifest = await this.repo.getManifest(workflowId);
-    if (!manifest) {
-      throw new WorkflowNotFoundError(`Workflow "${workflowId}" not found in repository.`, { workflowId });
-    }
-
-    if (!manifest.draftVersion) {
-      throw new WorkflowError(`Workflow "${workflowId}" has no draft version to promote.`);
-    }
-
-    const draftVersion = await this.repo.getVersion(workflowId, manifest.draftVersion);
-    if (!draftVersion) {
-      throw new WorkflowNotFoundError(
-        `Draft version ${manifest.draftVersion} for workflow "${workflowId}" not found on disk.`,
-        { workflowId, version: manifest.draftVersion }
-      );
-    }
-
-    // Locate and load evidence
-    let evidence = directEvidence;
-    let evidenceSourcePath = null;
-    if (!evidence) {
-      evidenceSourcePath = evidencePath
-        ? path.resolve(evidencePath)
-        : getStagedEvidencePath(this.repo.baseDir, workflowId, draftVersion.version);
-
-      try {
-        const raw = await fs.readFile(evidenceSourcePath, 'utf8');
-        evidence = JSON.parse(raw);
-      } catch (err) {
-        throw new WorkflowError(
-          `No trial verification evidence found for draft v${draftVersion.version} at "${evidenceSourcePath}". ` +
-            `Draft must be trialed successfully via "super-memory trial ${workflowId} --inputs <file>" before promotion.`
-        );
-      }
-    }
-
-    // Validate evidence schema and invariants
-    validateVerificationEvidence(evidence);
-
-    if (evidence.workflowId !== workflowId) {
-      throw new WorkflowValidationError(
-        `Verification evidence workflowId ("${evidence.workflowId}") does not match target workflow ("${workflowId}").`
-      );
-    }
-
-    if (evidence.version !== draftVersion.version) {
-      throw new WorkflowValidationError(
-        `Verification evidence version (v${evidence.version}) does not match draft version (v${draftVersion.version}).`
-      );
-    }
-
-    // Recompute current disk content hash and verify against evidence
-    const computedHash = calculateContentHash(draftVersion);
-    verifyEvidenceMatchesWorkflow(evidence, draftVersion, computedHash);
-
-    // Require all steps to have passed and criteria passed
-    if (!evidence.successCriteriaResult || !evidence.successCriteriaResult.passed) {
-      throw new WorkflowValidationError('Cannot promote draft: trial evidence reports that success criteria failed.');
-    }
-
-    for (const sr of evidence.stepResults || []) {
-      if (!sr.ok) {
-        throw new WorkflowValidationError(`Cannot promote draft: step "${sr.stepId}" failed during trial verification.`);
-      }
-    }
+    // Validate the full evidence chain without side effects; the promotion
+    // service re-validates from disk before mutating anything.
+    const preview = await this._promotionService().previewPromotion({
+      workflowId,
+      evidence: directEvidence,
+      evidencePath,
+    });
+    const { manifest, draftVersion, evidence, computedHash } = preview;
 
     let secrets = deriveSecrets(customSecrets, directInputs);
     if (!directInputs && inputsPath) {
@@ -638,19 +586,12 @@ export class OperatorCLI {
     this.write(`Enabled Status:  ${manifest.enabled ? 'ENABLED' : 'DISABLED'} (Preserved)`);
     this.write('--------------------------------------------------------------------------------');
 
-    // Operator Confirmation Check
+    // Operator confirmation: an explicit value is passed through for the
+    // promotion service to validate; otherwise prompt interactively with the
+    // exact historical prompt text.
     const expectedConfirmation = `PROMOTE ${workflowId}`;
-    let isConfirmed = false;
-
-    if (confirm !== undefined && confirm !== null) {
-      if (typeof confirm === 'string' && confirm.trim() === expectedConfirmation) {
-        isConfirmed = true;
-      } else if (confirm === true) {
-        isConfirmed = true;
-      } else {
-        isConfirmed = false;
-      }
-    } else {
+    let confirmation = confirm;
+    if (confirmation === undefined || confirmation === null) {
       // Interactive or piped confirmation
       const rl = readline.createInterface({
         input: this.stdin,
@@ -658,39 +599,26 @@ export class OperatorCLI {
       });
 
       try {
-        const answer = await rl.question(
+        confirmation = await rl.question(
           `To confirm promotion of draft v${draftVersion.version} to active status, type "${expectedConfirmation}": `
         );
-        isConfirmed = answer.trim() === expectedConfirmation;
       } finally {
         rl.close();
       }
     }
 
-    if (!isConfirmed) {
-      this.write(`Promotion cancelled by operator. (Expected "${expectedConfirmation}")`);
-      return { promoted: false, reason: 'cancelled' };
-    }
-
-    // Managed repositories are snapshotted before every promotion so a
-    // promotion is never a point of no return. Failure to snapshot aborts
-    // the promotion before anything changes.
-    await this._maintenanceService().snapshotBeforePromotion();
-
-    // Atomic promotion through validated repository lifecycle
-    const promotionResult = await this.repo.markVerified(workflowId, draftVersion.version, evidence);
-    await this._audit({
-      type: 'promotion',
+    // The service re-validates the evidence chain from disk, enforces
+    // explicit authorization, snapshots, promotes, audits, and cleans up.
+    const result = await this._promotionService().promote({
       workflowId,
-      version: draftVersion.version,
-      contentHash: evidence.contentHash,
+      evidence: directEvidence,
+      evidencePath,
+      confirm: confirmation,
     });
 
-    // Clean up staged evidence file if it exists
-    if (evidenceSourcePath) {
-      try {
-        await fs.unlink(evidenceSourcePath);
-      } catch {}
+    if (!result.promoted) {
+      this.write(`Promotion cancelled by operator. (Expected "${expectedConfirmation}")`);
+      return result;
     }
 
     this.write('--------------------------------------------------------------------------------');
@@ -698,12 +626,7 @@ export class OperatorCLI {
     this.write('Draft version has been cleared.');
     this.write('================================================================================');
 
-    return {
-      promoted: true,
-      manifest: promotionResult.manifest,
-      version: promotionResult.version,
-      evidence: promotionResult.evidence,
-    };
+    return result;
   }
 
   /**
