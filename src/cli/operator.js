@@ -34,17 +34,11 @@ import {
   WorkflowNotFoundError,
 } from '../workflow/index.js';
 
-import { createBrowserRuntime } from '../browser/index.js';
 import {
   createModelProvider,
   getPreferredRecoveryProvider,
 } from '../models/index.js';
-import {
-  validateTaskIntent,
-  findMatchingWorkflow,
-  DiscoveryOrchestrator,
-  parseNaturalLanguageTask,
-} from '../discovery/index.js';
+import { createDiscoveryService } from '../services/discovery.js';
 import {
   resolveWorkflowsDir,
   detectLegacyWorkflowsDir,
@@ -62,12 +56,12 @@ import { createPromotionService } from '../services/promotion.js';
 import { createRecoveryService } from '../services/recovery.js';
 import {
   createExecutionService,
-  ensureLocalFixtureIfTargeted,
   getStagedEvidencePath,
   loadInputs,
 } from '../services/execution.js';
 
 export { renderDiff, getStagedEvidencePath, loadInputs };
+export { resolveEffectiveInputs } from '../services/discovery.js';
 
 /**
  * Collects known sensitive values for output redaction from runtime input
@@ -88,63 +82,6 @@ export function deriveSecrets(...sources) {
     }
   }
   return out;
-}
-
-/**
- * Establishes the single validated source of truth for effective runtime
- * inputs during discovery: the merge of TaskIntent parameters and any
- * separately supplied runtime inputs (direct object or --inputs file).
- *
- * Rules (fail closed; error messages name inputs, never values):
- * - Every runtime input must be declared as a task parameter.
- * - When both sources supply a non-empty value for the same input, the
- *   values must agree exactly; a conflict is rejected rather than silently
- *   preferring one source across discovery, lookup, and playback.
- * - An empty intent value means "supplied at runtime" and is filled from
- *   the runtime inputs; otherwise the intent value is the effective value.
- *
- * @param {object} intent - Validated TaskIntent
- * @param {object} runtimeInputs - Runtime input values by name
- * @returns {Record<string, string>} Effective runtime inputs by name
- */
-export function resolveEffectiveInputs(intent, runtimeInputs = {}) {
-  if (!runtimeInputs || typeof runtimeInputs !== 'object' || Array.isArray(runtimeInputs)) {
-    throw new WorkflowError('Runtime inputs must be an object mapping input names to string values.');
-  }
-
-  const declared = new Map();
-  for (const param of intent?.parameters || []) {
-    if (param && typeof param.name === 'string') {
-      declared.set(param.name, param);
-    }
-  }
-
-  const inputs = {};
-  for (const [name, value] of Object.entries(runtimeInputs)) {
-    if (typeof value !== 'string') {
-      throw new WorkflowError(`Runtime input "${name}" must be a string value.`);
-    }
-    if (!declared.has(name)) {
-      throw new WorkflowError(
-        `Runtime input "${name}" is not declared in the task intent parameters. Declare it in the intent or remove it from the inputs file.`
-      );
-    }
-    const intentValue = declared.get(name).value;
-    if (typeof intentValue === 'string' && intentValue !== '' && value !== intentValue) {
-      throw new WorkflowError(
-        `Runtime input "${name}" conflicts with the task intent parameter of the same name. Provide one consistent value in the intent and the inputs file.`
-      );
-    }
-    inputs[name] = value;
-  }
-
-  for (const param of intent?.parameters || []) {
-    if (param && typeof param.name === 'string' && inputs[param.name] === undefined) {
-      inputs[param.name] = param.value;
-    }
-  }
-
-  return inputs;
 }
 
 /**
@@ -186,6 +123,79 @@ function formatStepParams(params, secrets = []) {
   if (params.label) parts.push(`label: "${redactSecrets(params.label, secrets)}"`);
   if (params.inputName) parts.push(`inputName: "${redactSecrets(params.inputName, secrets)}"`);
   return parts.length > 0 ? `(${parts.join(', ')})` : '';
+}
+
+/**
+ * Deterministic fixture-specific mock provider for offline discovery runs
+ * (`--offline` / `--provider mock`). Scripted against the local store
+ * fixture flow and unsuitable for any other purpose. Owned by the CLI
+ * adapter: the generic discovery service only ever receives the resulting
+ * provider instance.
+ *
+ * @returns {{ provider: string, modelId: string, complete: Function }}
+ */
+function buildOfflineDiscoveryProvider() {
+  let callCount = 0;
+  return {
+    provider: 'meta',
+    modelId: 'muse-spark-1.3-discovery-mock',
+    async complete({ prompt, messages } = {}) {
+      const lastMsg = (messages && messages[messages.length - 1]?.content) || prompt || '';
+      if (lastMsg.includes('/store')) {
+        if (callCount === 0) {
+          callCount++;
+          return {
+            text: JSON.stringify({
+              action: 'fillByLabel',
+              elementIndex: 0,
+              label: 'Search Product',
+              inputName: 'search_item',
+              rationale: 'Search for the desired item in the store',
+            }),
+          };
+        }
+        return {
+          text: JSON.stringify({
+            action: 'clickByRole',
+            elementIndex: 1,
+            role: 'button',
+            name: 'Add to Cart',
+            rationale: 'Submit search and add item to cart',
+          }),
+        };
+      }
+      if (lastMsg.includes('/cart')) {
+        return {
+          text: JSON.stringify({
+            action: 'clickByRole',
+            elementIndex: 0,
+            role: 'link',
+            name: 'Proceed to Checkout',
+            rationale: 'Navigate to checkout page',
+          }),
+        };
+      }
+      if (lastMsg.includes('/checkout')) {
+        return {
+          text: JSON.stringify({
+            action: 'clickByRole',
+            elementIndex: 0,
+            role: 'button',
+            name: 'Complete Order',
+            rationale: 'Finalize order and navigate to receipt',
+            done: true,
+          }),
+        };
+      }
+      return {
+        text: JSON.stringify({
+          action: 'navigate',
+          path: '/receipt',
+          done: true,
+        }),
+      };
+    },
+  };
 }
 
 /**
@@ -295,6 +305,64 @@ export class OperatorCLI {
       repository: this.repo,
       execution: this._executionService({ allowLocalhost, headless }),
     });
+  }
+
+  /**
+   * Builds a workflow discovery service bound to the current context.
+   * Per-call construction keeps the repository reference aligned with the
+   * live CLI instance.
+   */
+  _discoveryService({ allowLocalhost, headless } = {}) {
+    return createDiscoveryService({
+      repository: this.repo,
+      execution: this._executionService({ allowLocalhost, headless }),
+      browserRuntime: this.browserRuntime,
+    });
+  }
+
+  /**
+   * Resolves the model provider for natural-language intent parsing.
+   * Fixture mocks are rejected: free text requires a real provider.
+   */
+  _resolveNlProvider(provider) {
+    let nlProvider = provider || this.modelProvider;
+    if (typeof nlProvider === 'string') {
+      if (nlProvider === 'mock' || nlProvider === 'offline') {
+        throw new Error(
+          'Plain-language discovery requires a real model provider for intent parsing; "mock"/"offline" cannot interpret free text. Provide --intent <path> for deterministic offline use.'
+        );
+      }
+      nlProvider = createModelProvider(nlProvider);
+    } else if (!nlProvider) {
+      try {
+        nlProvider = getPreferredRecoveryProvider();
+      } catch {
+        throw new Error(
+          'Plain-language discovery requires META_API_KEY, MODEL_API_KEY, or BASETEN_API_KEY. Otherwise provide --intent <path> for deterministic offline use.'
+        );
+      }
+    }
+    if (!nlProvider || typeof nlProvider.complete !== 'function') {
+      throw new Error('Plain-language discovery requires a model provider with a complete() method.');
+    }
+    return nlProvider;
+  }
+
+  /**
+   * Resolves the model provider for the discovery loop. Accepts the
+   * deterministic fixture-specific mock for offline runs.
+   */
+  _resolveDiscoveryProvider(provider) {
+    let modelProvider = provider || this.modelProvider;
+    if (typeof modelProvider === 'string') {
+      if (modelProvider === 'mock' || modelProvider === 'offline') {
+        return buildOfflineDiscoveryProvider();
+      }
+      modelProvider = createModelProvider(modelProvider);
+    } else if (!modelProvider) {
+      modelProvider = getPreferredRecoveryProvider();
+    }
+    return modelProvider;
   }
 
   _executionService({ allowLocalhost, headless } = {}) {
@@ -897,8 +965,9 @@ export class OperatorCLI {
           ? this.homePaths.journals
           : path.join(os.tmpdir(), 'super-memory-discovery-journal')
         : journalDir;
-    let intent;
-    let preloadedInputs;
+    // Intent files are read here; normalization and validation of every
+    // input form lives in the discovery service.
+    let task = taskIntentOrObjective;
     if (intentPath) {
       const resolved = path.resolve(intentPath);
       let raw;
@@ -911,274 +980,100 @@ export class OperatorCLI {
         throw err;
       }
       try {
-        intent = JSON.parse(raw);
+        task = JSON.parse(raw);
       } catch (err) {
         throw new Error(`Failed to parse JSON in intent file "${resolved}": ${err.message}`);
       }
-      validateTaskIntent(intent);
-    } else if (taskIntentOrObjective && typeof taskIntentOrObjective === 'object') {
-      intent = taskIntentOrObjective;
-      validateTaskIntent(intent);
-    } else if (typeof taskIntentOrObjective === 'string' && taskIntentOrObjective.trim().startsWith('{')) {
-      intent = JSON.parse(taskIntentOrObjective);
-      validateTaskIntent(intent);
-    } else {
-      const request = String(taskIntentOrObjective || '').trim();
-      if (!request) {
-        throw new Error('A task objective is required. Provide plain text plus --origin, or provide --intent <path>.');
-      }
-      if (!origin) {
-        throw new Error('Plain-language discovery requires an explicit --origin. The model must not invent a target origin.');
-      }
-      const loadedParams = directInputs || (inputsPath ? await loadInputs(inputsPath) : {});
-      preloadedInputs = loadedParams;
-      const fixedParams = Array.isArray(parameters) && parameters.length > 0
-        ? parameters
-        : Object.entries(loadedParams).map(([name, value]) => ({ name, value: String(value) }));
-
-      let nlProvider = provider || this.modelProvider;
-      if (typeof nlProvider === 'string') {
-        if (nlProvider === 'mock' || nlProvider === 'offline') {
-          throw new Error(
-            'Plain-language discovery requires a real model provider for intent parsing; "mock"/"offline" cannot interpret free text. Provide --intent <path> for deterministic offline use.'
-          );
-        }
-        nlProvider = createModelProvider(nlProvider);
-      } else if (!nlProvider) {
-        try {
-          nlProvider = getPreferredRecoveryProvider();
-        } catch {
-          throw new Error(
-            'Plain-language discovery requires META_API_KEY, MODEL_API_KEY, or BASETEN_API_KEY. Otherwise provide --intent <path> for deterministic offline use.'
-          );
-        }
-      }
-      if (!nlProvider || typeof nlProvider.complete !== 'function') {
-        throw new Error('Plain-language discovery requires a model provider with a complete() method.');
-      }
-
-      try {
-        intent = await parseNaturalLanguageTask({
-          provider: nlProvider,
-          request,
-          targetOrigin: origin,
-          startPath,
-          fixedParameters: fixedParams,
-        });
-      } catch (err) {
-        if (err && err.needsClarification) {
-          throw new Error(`Ambiguous task request: ${err.message} Refine the objective or provide --intent <path>.`);
-        }
-        throw err;
-      }
     }
 
-    // Single source of truth for effective runtime inputs: intent parameters
-    // reconciled with any separately supplied runtime inputs. Conflicts,
-    // undeclared runtime inputs, and non-string values are rejected here so
-    // discovery, lookup, secrets, and playback can never silently diverge.
-    const runtimeInputs = directInputs || preloadedInputs || (inputsPath ? await loadInputs(inputsPath) : {});
-    const effectiveInputs = resolveEffectiveInputs(intent, runtimeInputs);
-    intent = {
-      ...intent,
-      parameters: (intent.parameters || []).map((param) => ({
-        ...param,
-        value: effectiveInputs[param.name],
-      })),
-    };
-    validateTaskIntent(intent);
+    const inputs = directInputs || (inputsPath ? await loadInputs(inputsPath) : {});
 
-    const isLocalhostAllowed = allowLocalhost ?? this.allowLocalhost;
-    const isHeadless = headless ?? this.headless;
+    const outcome = await this._discoveryService({ allowLocalhost, headless }).discover({
+      task,
+      origin,
+      startPath,
+      parameters,
+      inputs,
+      getNlProvider: () => this._resolveNlProvider(provider),
+      getDiscoveryProvider: () => this._resolveDiscoveryProvider(provider),
+      approveAction,
+      journalDir: effectiveJournalDir,
+      allowLocalhost: allowLocalhost ?? this.allowLocalhost,
+      headless: headless ?? this.headless,
+      onEvent: (ev) => {
+        if (!ev || typeof ev !== 'object') return;
+        if (ev.event === 'lookup-check') {
+          this.write(`Checking existing workflows for reusable match on origin "${ev.targetOrigin}"...`);
+        } else if (ev.event === 'lookup-miss') {
+          this.write('[Lookup Miss] No matching workflow found. Initiating discovery session...');
+        } else if (ev.event === 'observe') {
+          this.write(`  [Step ${ev.stepIndex + 1}] Observing ${ev.url} (${ev.elementsCount} elements)`);
+        } else if (ev.event === 'decide') {
+          this.write(`  [Step ${ev.stepIndex + 1}] Action: ${ev.action} -> ${ev.name || ev.label || ''}`);
+        }
+      },
+    });
 
-    // Step 1: Check existing workflows for lookup match
-    this.write(`Checking existing workflows for reusable match on origin "${intent.targetOrigin}"...`);
-    const match = await findMatchingWorkflow(this.repo, intent);
-
-    if (match.ambiguous) {
-      const lookupSecrets = deriveSecrets((intent.parameters || []).map((p) => p.value));
+    if (outcome.action === 'ambiguous') {
+      const lookupSecrets = deriveSecrets((outcome.intent.parameters || []).map((p) => p.value));
       this.writeErr(
-        `Ambiguous workflow lookup: ${match.candidates.length} verified workflows match "${redactSecrets(intent.objective || '', lookupSecrets)}". ` +
+        `Ambiguous workflow lookup: ${outcome.candidates.length} verified workflows match "${redactSecrets(outcome.intent.objective || '', lookupSecrets)}". ` +
           `Refine the objective, parameters, or success conditions instead of running an uncertain workflow.`
       );
       return {
         action: 'ambiguous',
-        candidates: match.candidates,
+        candidates: outcome.candidates,
         trace: [],
       };
     }
 
-    if (match.match) {
-      this.write(`\n[Lookup Hit] Found existing verified workflow "${match.workflowId}" (v${match.version}).`);
+    if (outcome.action === 'reused') {
+      this.write(`\n[Lookup Hit] Found existing verified workflow "${outcome.workflowId}" (v${outcome.version}).`);
       this.write('Reusing verified workflow without model discovery calls...');
-
-      const inputs = effectiveInputs;
-
-      const playResult = await this.play(match.workflowId, {
-        inputs,
-        allowLocalhost: isLocalhostAllowed,
-        headless: isHeadless,
-      });
-
+      this.write(`Executing active verified version for workflow "${outcome.workflowId}"...`);
+      if (outcome.result.ok) {
+        this.write(`Playback succeeded! Active version v${outcome.result.version} finished in ${outcome.result.durationMs}ms.`);
+      } else {
+        this.write(
+          `Playback failed: active version v${outcome.result.version} encountered an error: ${redactSecrets(outcome.result.error, deriveSecrets(inputs))}`
+        );
+      }
       return {
         action: 'reused',
-        workflowId: match.workflowId,
-        version: match.version,
-        result: playResult,
+        workflowId: outcome.workflowId,
+        version: outcome.version,
+        result: outcome.result,
       };
     }
 
-    // Step 2: Discovery session
-    this.write('[Lookup Miss] No matching workflow found. Initiating discovery session...');
-
-    let modelProvider = provider || this.modelProvider;
-    if (typeof modelProvider === 'string') {
-      if (modelProvider === 'mock' || modelProvider === 'offline') {
-        let callCount = 0;
-        modelProvider = {
-          provider: 'meta',
-          modelId: 'muse-spark-1.3-discovery-mock',
-          async complete({ prompt, messages } = {}) {
-            const lastMsg = (messages && messages[messages.length - 1]?.content) || prompt || '';
-            if (lastMsg.includes('/store')) {
-              if (callCount === 0) {
-                callCount++;
-                return {
-                  text: JSON.stringify({
-                    action: 'fillByLabel',
-                    elementIndex: 0,
-                    label: 'Search Product',
-                    inputName: 'search_item',
-                    rationale: 'Search for the desired item in the store',
-                  }),
-                };
-              }
-              return {
-                text: JSON.stringify({
-                  action: 'clickByRole',
-                  elementIndex: 1,
-                  role: 'button',
-                  name: 'Add to Cart',
-                  rationale: 'Submit search and add item to cart',
-                }),
-              };
-            }
-            if (lastMsg.includes('/cart')) {
-              return {
-                text: JSON.stringify({
-                  action: 'clickByRole',
-                  elementIndex: 0,
-                  role: 'link',
-                  name: 'Proceed to Checkout',
-                  rationale: 'Navigate to checkout page',
-                }),
-              };
-            }
-            if (lastMsg.includes('/checkout')) {
-              return {
-                text: JSON.stringify({
-                  action: 'clickByRole',
-                  elementIndex: 0,
-                  role: 'button',
-                  name: 'Complete Order',
-                  rationale: 'Finalize order and navigate to receipt',
-                  done: true,
-                }),
-              };
-            }
-            return {
-              text: JSON.stringify({
-                action: 'navigate',
-                path: '/receipt',
-                done: true,
-              }),
-            };
-          },
-        };
-      } else {
-        modelProvider = createModelProvider(modelProvider);
+    if (outcome.action === 'failed') {
+      this.writeErr(`Discovery failed: ${outcome.status} (${outcome.reason || 'unverifiable'})`);
+      if (outcome.journalPath) {
+        this.writeErr(`Scratch journal retained at: ${outcome.journalPath} (diagnostic only; never auto-resumed)`);
       }
-    } else if (!modelProvider) {
-      modelProvider = getPreferredRecoveryProvider();
-    }
-
-    let ownRuntime = null;
-    let runtime = this.browserRuntime;
-    if (!runtime) {
-      ownRuntime = await createBrowserRuntime({ headless: isHeadless });
-      runtime = ownRuntime;
-    }
-
-    let autoFixtureServer = null;
-    if (isLocalhostAllowed) {
-      autoFixtureServer = await ensureLocalFixtureIfTargeted(intent.targetOrigin);
-    }
-
-    try {
-      const orchestrator = new DiscoveryOrchestrator({
-        browserRuntime: runtime,
-        modelProvider,
-        allowLocalhost: isLocalhostAllowed,
-        approveAction,
-        journalDir: effectiveJournalDir,
-        onEvent: (ev) => {
-          if (ev.event === 'observe') {
-            this.write(`  [Step ${ev.stepIndex + 1}] Observing ${ev.url} (${ev.elementsCount} elements)`);
-          } else if (ev.event === 'decide') {
-            this.write(`  [Step ${ev.stepIndex + 1}] Action: ${ev.action} -> ${ev.name || ev.label || ''}`);
-          }
-        },
-      });
-
-      const discoveryRes = await orchestrator.runDiscovery(intent);
-
-      if (discoveryRes.status !== 'SUCCESS') {
-        this.writeErr(`Discovery failed: ${discoveryRes.status} (${discoveryRes.reason || 'unverifiable'})`);
-        if (orchestrator.lastJournalPath) {
-          this.writeErr(`Scratch journal retained at: ${orchestrator.lastJournalPath} (diagnostic only; never auto-resumed)`);
-        }
-        return {
-          action: 'failed',
-          status: discoveryRes.status,
-          reason: discoveryRes.reason,
-          trace: discoveryRes.trace,
-          journalPath: orchestrator.lastJournalPath,
-        };
-      }
-
-      this.write('\nDiscovery outcome verified! Converting trace to candidate workflow draft...');
-      await this.repo.createWorkflow({
-        id: discoveryRes.candidate.workflowId,
-        name: discoveryRes.candidate.changeSummary || 'Discovered Workflow',
-        description: discoveryRes.candidate.changeSummary || 'Discovered Workflow',
-        target: discoveryRes.candidate.target,
-        inputs: discoveryRes.candidate.inputs,
-        steps: discoveryRes.candidate.steps,
-        successCriteria: discoveryRes.candidate.successCriteria,
-        schemaVersion: discoveryRes.candidate.schemaVersion,
-      });
-
-      this.write(`Successfully created workflow "${discoveryRes.candidate.workflowId}" with unapproved draft v1.`);
-      this.write(`Content Hash:     ${discoveryRes.contentHash}`);
-      this.write(`To review draft:  node scripts/super-memory.js inspect ${discoveryRes.candidate.workflowId}`);
-      this.write(`To trial draft:   node scripts/super-memory.js trial ${discoveryRes.candidate.workflowId} --inputs <file>`);
-      this.write(`To promote draft: node scripts/super-memory.js promote ${discoveryRes.candidate.workflowId}`);
-
       return {
-        action: 'discovered',
-        workflowId: discoveryRes.candidate.workflowId,
-        draft: discoveryRes.candidate,
-        contentHash: discoveryRes.contentHash,
-        trace: discoveryRes.trace,
+        action: 'failed',
+        status: outcome.status,
+        reason: outcome.reason,
+        trace: outcome.trace,
+        journalPath: outcome.journalPath,
       };
-    } finally {
-      if (ownRuntime) {
-        await ownRuntime.close().catch(() => {});
-      }
-      if (autoFixtureServer) {
-        await new Promise((res) => autoFixtureServer.close(res)).catch(() => {});
-      }
     }
+
+    this.write('\nDiscovery outcome verified! Converting trace to candidate workflow draft...');
+    this.write(`Successfully created workflow "${outcome.workflowId}" with unapproved draft v1.`);
+    this.write(`Content Hash:     ${outcome.contentHash}`);
+    this.write(`To review draft:  node scripts/super-memory.js inspect ${outcome.workflowId}`);
+    this.write(`To trial draft:   node scripts/super-memory.js trial ${outcome.workflowId} --inputs <file>`);
+    this.write(`To promote draft: node scripts/super-memory.js promote ${outcome.workflowId}`);
+
+    return {
+      action: 'discovered',
+      workflowId: outcome.workflowId,
+      draft: outcome.draft,
+      contentHash: outcome.contentHash,
+      trace: outcome.trace,
+    };
   }
 
   /**
