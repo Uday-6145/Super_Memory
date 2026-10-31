@@ -29,10 +29,6 @@ import { parseArgs } from 'node:util';
 
 import {
   FileSystemWorkflowRepository,
-  WorkflowPlayer,
-  collectFailureDiagnostic,
-  generateRepairProposal,
-  applyRepairToDraft,
   redactSecrets,
   WorkflowError,
   WorkflowNotFoundError,
@@ -63,6 +59,7 @@ import {
 } from '../services/workflow-query.js';
 import { createMaintenanceService } from '../services/maintenance.js';
 import { createPromotionService } from '../services/promotion.js';
+import { createRecoveryService } from '../services/recovery.js';
 import {
   createExecutionService,
   ensureLocalFixtureIfTargeted,
@@ -290,6 +287,13 @@ export class OperatorCLI {
       repository: this.repo,
       maintenance: this._maintenanceService(),
       audit: (event, options) => this._audit(event, options),
+    });
+  }
+
+  _recoveryService({ allowLocalhost, headless } = {}) {
+    return createRecoveryService({
+      repository: this.repo,
+      execution: this._executionService({ allowLocalhost, headless }),
     });
   }
 
@@ -747,53 +751,9 @@ export class OperatorCLI {
       throw new WorkflowError(`Workflow "${workflowId}" has no active verified version to repair.`);
     }
 
-    const activeVersion = await this.repo.getVersion(workflowId, manifest.activeVersion);
     const inputs = directInputs || (await loadInputs(inputsPath));
     const secrets = deriveSecrets(inputs);
 
-    const isLocalhostAllowed = allowLocalhost ?? this.allowLocalhost;
-    const isHeadless = headless ?? this.headless;
-
-    const player = new WorkflowPlayer({
-      repository: this.repo,
-      browserRuntime: this.browserRuntime,
-      allowLocalhost: isLocalhostAllowed,
-      headless: isHeadless,
-    });
-
-    this.write(`Running active verified version v${manifest.activeVersion} to diagnose failure...`);
-
-    let runResult;
-    try {
-      runResult = await player.play(workflowId, inputs, { allowLocalhost: isLocalhostAllowed });
-    } finally {
-      if (!this.browserRuntime) {
-        await player.close();
-      }
-    }
-
-    if (runResult.ok) {
-      this.write(`Active version v${manifest.activeVersion} passed without errors. No repair needed.`);
-      return { repaired: false, reason: 'active_passed' };
-    }
-
-    this.write(`Active version playback failed: ${redactSecrets(runResult.error, secrets)}`);
-    this.write('Collecting failure diagnostics and DOM snapshot...');
-
-    const failedStep = activeVersion.steps?.find((s) => s.id === runResult.failedStepId) || null;
-    const diagnostic =
-      runResult.diagnostic ||
-      (await collectFailureDiagnostic({
-        workflowId,
-        version: activeVersion.version,
-        error: runResult.error,
-        failedStep,
-        session: null,
-        secrets,
-      }));
-
-    this.write(`Failure Category: ${diagnostic.category}`);
-    this.write('Generating repair proposal using Meta reasoning model...');
 
     let modelProvider = provider || this.modelProvider;
     if (typeof modelProvider === 'string') {
@@ -865,21 +825,28 @@ export class OperatorCLI {
     } else if (!modelProvider) {
       modelProvider = getPreferredRecoveryProvider();
     }
-    const proposalResult = await generateRepairProposal(
-      modelProvider,
-      diagnostic,
-      activeVersion,
-      retries !== undefined ? { retries } : {}
-    );
-    const proposal = proposalResult.proposal;
-
-    this.write(`Proposal received for step "${proposal.stepId}": ${redactSecrets(proposal.suspectedCause, secrets)}`);
-    this.write('Applying proposal to create unapproved draft version...');
-
-    const draft = await applyRepairToDraft(this.repo, proposal, {
-      changeSummary: proposal.suspectedCause,
+    const outcome = await this._recoveryService({ allowLocalhost, headless }).proposeRepair({
+      workflowId,
+      inputs,
+      provider: modelProvider,
+      retries,
       secrets,
     });
+
+    if (!outcome.repaired) {
+      this.write(`Running active verified version v${outcome.runResult.version} to diagnose failure...`);
+      this.write(`Active version v${outcome.runResult.version} passed without errors. No repair needed.`);
+      return { repaired: false, reason: 'active_passed' };
+    }
+
+    const { runResult, diagnostic, proposal, draft } = outcome;
+    this.write(`Running active verified version v${runResult.version} to diagnose failure...`);
+    this.write(`Active version playback failed: ${redactSecrets(runResult.error, secrets)}`);
+    this.write('Collecting failure diagnostics and DOM snapshot...');
+    this.write(`Failure Category: ${diagnostic.category}`);
+    this.write('Generating repair proposal using Meta reasoning model...');
+    this.write(`Proposal received for step "${proposal.stepId}": ${redactSecrets(proposal.suspectedCause, secrets)}`);
+    this.write('Applying proposal to create unapproved draft version...');
 
     this.write(`\nSuccessfully created unapproved draft v${draft.version}.`);
     this.write(`To review diff:   node scripts/super-memory.js review ${workflowId}`);
