@@ -356,10 +356,16 @@ export async function discover(
       };
     }
 
+    // The manifest name is limited to 100 characters while the change
+    // summary is not. Derive a valid name from the full summary without
+    // modifying the candidate itself; the description keeps everything.
+    const summary = discoveryRes.candidate.changeSummary || 'Discovered Workflow';
+    const name = summary.length > 100 ? `${summary.slice(0, 97)}...` : summary;
+
     await context.repository.createWorkflow({
       id: discoveryRes.candidate.workflowId,
-      name: discoveryRes.candidate.changeSummary || 'Discovered Workflow',
-      description: discoveryRes.candidate.changeSummary || 'Discovered Workflow',
+      name,
+      description: summary,
       target: discoveryRes.candidate.target,
       inputs: discoveryRes.candidate.inputs,
       steps: discoveryRes.candidate.steps,

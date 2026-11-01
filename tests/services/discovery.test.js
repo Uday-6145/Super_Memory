@@ -643,6 +643,140 @@ describe('Discovery Service (M2 Phase 6)', () => {
     );
   });
 
+  it('persists a valid manifest name for objectives of any length', async () => {
+    async function discoverWithObjective(objective) {
+      const repo = await makeRepo(path.join(root, `w-name-${objective.length}`));
+      let current = {
+        url: `${ORIGIN}/catalog`,
+        title: 'Catalog',
+        text: 'items here',
+        elements: [
+          { tag: 'input', role: 'textbox', name: null, type: 'text', placeholder: null, label: 'Item', href: null, disabled: false },
+          { tag: 'button', role: 'button', name: 'Add to basket', type: 'submit', placeholder: null, label: null, href: null, disabled: false },
+        ],
+      };
+      const session = {
+        async navigate() {},
+        async getSnapshot() { return current; },
+        async fillByLabel() { current = { ...current, text: 'items here Widget' }; },
+        async clickByRole() {
+          current = { url: `${ORIGIN}/basket`, title: 'Basket', text: 'Widget', elements: [] };
+        },
+        async close() {},
+      };
+      const svc = createDiscoveryService({
+        repository: repo,
+        execution: { playWorkflow: async (args) => ({ ok: true, version: 1, result: args }) },
+        browserRuntime: stubRuntime(session, []),
+      });
+      const intent = makeIntent({
+        objective,
+        parameters: [{ name: 'item', type: 'string', label: 'Item', description: 'd', required: true, value: '' }],
+        successConditions: [
+          { type: 'finalPath', expected: '/basket' },
+          { type: 'textPresent', input: 'item' },
+        ],
+      });
+      const outcome = await svc.discover({
+        task: intent,
+        inputs: { item: 'Widget' },
+        journalDir: null,
+        getDiscoveryProvider: async () => {
+          let n = 0;
+          return {
+            provider: 'mock-test',
+            modelId: 'mock-test-1',
+            complete: async () => {
+              n += 1;
+              if (n === 1) {
+                return { text: JSON.stringify({ action: 'fillByLabel', elementIndex: 0, label: 'Item', inputName: 'item', rationale: 'enter' }) };
+              }
+              return { text: JSON.stringify({ action: 'clickByRole', elementIndex: 1, role: 'button', name: 'Add to basket', rationale: 'add' }) };
+            },
+          };
+        },
+        fixtureStarter: async () => null,
+      });
+      assert.equal(outcome.action, 'discovered');
+      return { repo, svc, intent, outcome };
+    }
+
+    const atLength = (n) => `Objective ${'x'.repeat(n - 10)}`;
+    assert.equal(atLength(35).length, 35);
+    assert.equal(atLength(88).length, 88);
+
+    // 35-char objective: full summary preserved as the manifest name.
+    {
+      const { repo, outcome } = await discoverWithObjective(atLength(35));
+      const manifest = await repo.getManifest(outcome.workflowId);
+      assert.equal(manifest.name, `Discovered: ${atLength(35)}`);
+      assert.equal(manifest.name.length, 47);
+      assert.equal(manifest.description, manifest.name);
+    }
+
+    // 88-char objective: 100-char summary used unchanged (boundary).
+    {
+      const { repo, outcome } = await discoverWithObjective(atLength(88));
+      const manifest = await repo.getManifest(outcome.workflowId);
+      assert.equal(manifest.name.length, 100);
+      assert.equal(manifest.name, `Discovered: ${atLength(88)}`);
+    }
+
+    // 89-char objective: truncated to exactly 100 characters.
+    {
+      const { repo, outcome } = await discoverWithObjective(atLength(89));
+      const manifest = await repo.getManifest(outcome.workflowId);
+      const full = `Discovered: ${atLength(89)}`;
+      assert.equal(full.length, 101);
+      assert.equal(manifest.name.length, 100);
+      assert.equal(manifest.name, `${full.slice(0, 97)}...`);
+      assert.equal(manifest.description, full, 'description keeps the complete summary');
+    }
+
+    // 171-char objective (the reported Wikipedia length): persists, lists,
+    // inspects, and is reusable via lookup.
+    {
+      const objective = atLength(171);
+      const { repo, svc, intent, outcome } = await discoverWithObjective(objective);
+      const manifest = await repo.getManifest(outcome.workflowId);
+      assert.equal(manifest.name.length, 100);
+      assert.ok(manifest.name.endsWith('...'));
+      assert.equal(manifest.description, `Discovered: ${objective}`);
+      assert.equal(manifest.description.length, 183);
+
+      const listed = await repo.list({});
+      assert.ok(listed.some((w) => w.id === outcome.workflowId), 'persisted workflow is listed');
+
+      const inspected = await repo.getVersion(outcome.workflowId, 1);
+      assert.equal(inspected.workflowId, outcome.workflowId);
+
+      // Discovery never activates; after explicit verification the long-
+      // objective workflow is selected for reuse by lookup.
+      await repo.markVerified(outcome.workflowId, 1, sampleEvidence(outcome.workflowId, inspected));
+      const replay = await svc.discover({ task: intent, inputs: { item: 'Widget' }, journalDir: null });
+      assert.equal(replay.action, 'reused', 'long-objective workflow is selected for reuse');
+      assert.equal(replay.workflowId, outcome.workflowId);
+    }
+
+    // The schema still rejects overlong names from callers that bypass the
+    // service boundary.
+    {
+      const repo = await makeRepo(path.join(root, 'w-name-direct'));
+      await assert.rejects(
+        () => repo.createWorkflow({
+          id: 'wf_bad_name',
+          name: 'y'.repeat(101),
+          description: 'd',
+          target: { origin: ORIGIN, startPath: '/catalog' },
+          inputs: [],
+          steps: [{ id: 's1', order: 1, action: 'navigate', description: 'd', params: { path: '/catalog' } }],
+          successCriteria: { finalPath: '/done' },
+        }),
+        /at most 100 characters/
+      );
+    }
+  });
+
   it('fails closed on unresolved parameter references without browser or model use', async () => {
     const repo = await makeRepo(path.join(root, 'w-preflight'));
     const session = stubSession();
