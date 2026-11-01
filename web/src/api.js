@@ -26,3 +26,15 @@ export async function apiPost(pathname, body) {
   });
   return readJson(res);
 }
+
+export async function fetchWorkflows() {
+  return apiGet('/api/workflows');
+}
+
+export async function fetchWorkflow(workflowId) {
+  return apiGet(`/api/workflows/${encodeURIComponent(workflowId)}`);
+}
+
+export async function fetchReview(workflowId) {
+  return apiGet(`/api/workflows/${encodeURIComponent(workflowId)}/review`);
+}

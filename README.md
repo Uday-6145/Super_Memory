@@ -353,9 +353,9 @@ Open `http://127.0.0.1:3939` in a browser (or `http://127.0.0.1:5173` in develop
 
 Environment: `SUPER_MEMORY_HOME` selects the managed home, `WORKFLOWS_DIR` overrides the workflow repository, `PORT` sets the default port.
 
-### Current scope (M3.1)
+### Current scope (M3.1 foundation, M3.2 library UI)
 
-Read-only foundation only: pairing/session auth, workflow listing, inspection, draft review, and integrity scanning. Execution, discovery, repair, trial, promotion, backup, and restore remain CLI-only until later M3 milestones. The serial browser-operation policy (one browser job at a time) is recorded as an architectural constraint and will be enforced before the first browser-operating API lands.
+Read-only application only: pairing/session auth, workflow library with client-side search, filters (enabled/disabled, active/draft) and sorting, workflow detail (overview, active and draft versions, inputs, steps, success criteria), and draft review rendering. Detail navigation uses hash routes (`#/w/<workflowId>`) because the static server has no history-API fallback. Origin filtering is intentionally deferred (the list endpoint carries no origin; per-workflow inspection would be needed). Execution, discovery, repair, trial, promotion, backup, and restore remain CLI-only until later M3 milestones. The serial browser-operation policy (one browser job at a time) is recorded as an architectural constraint and will be enforced before the first browser-operating API lands.
 
 ### Security boundaries
 
