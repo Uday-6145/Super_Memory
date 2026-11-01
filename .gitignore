@@ -38,3 +38,6 @@ ehthumbs.db
 
 # Super Memory local workflow and runtime persistence
 .super-memory/
+
+# Production React build (regenerate with `npm run web:build`)
+web/dist/

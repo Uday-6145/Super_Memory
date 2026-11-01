@@ -47,6 +47,7 @@ import {
   HOME_ENV_VAR,
 } from '../config/home.js';
 import { appendAuditEvent } from '../config/audit.js';
+import { acquireRepositoryLocks, RepositoryLockError } from '../config/repository-lock.js';
 import {
   createWorkflowQueryService,
   renderDiff,
@@ -1131,6 +1132,26 @@ export class OperatorCLI {
     const command = positionals[0];
     const targetId = positionals[1];
 
+    // Exclusive cross-process lock: the application server and the CLI must
+    // never operate on the same managed home / repository at the same time.
+    // Help and empty invocations return above without touching the
+    // repository, so they never acquire the lock. Lock failures report a
+    // clear error and keep the existing exit-code contract.
+    let repoLocks = null;
+    try {
+      repoLocks = await acquireRepositoryLocks({
+        home: this.homeDir,
+        workflowsDir: this.workflowsDir,
+        displayName: 'super-memory-cli',
+      });
+    } catch (err) {
+      if (err instanceof RepositoryLockError) {
+        this.writeErr(`Error: ${err.message}`);
+        return 1;
+      }
+      throw err;
+    }
+
     try {
       switch (command) {
         case 'list':
@@ -1249,6 +1270,14 @@ export class OperatorCLI {
     } catch (err) {
       this.writeErr(`Error: ${err.message}`);
       return 1;
+    } finally {
+      if (repoLocks) {
+        try {
+          await repoLocks.release();
+        } catch (releaseErr) {
+          this.writeErr(`Warning: failed to release repository lock: ${releaseErr.message}`);
+        }
+      }
     }
   }
 

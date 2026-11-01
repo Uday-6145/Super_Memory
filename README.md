@@ -323,3 +323,40 @@ node --env-file=.env scripts/demo-recovery.js --no-headless
 5. **Grounded Repairs:** A repair proposal is rejected before any draft is created unless its exact target (role and accessible name, or field label) was observed, enabled, on the workflow's own target origin in the failure snapshot. Page-text substrings never count as grounding.
 6. **Preflight Verification Inputs:** Every input referenced by a workflow's success criteria must be supplied with a usable value before any browser session launches, in both playback and discovery.
 7. **Known Limitations:** Trial evidence is hash-bound but unsigned and trusted within the local-operator model. Lookup is intentionally conservative and misses some paraphrased tasks. Criteria-only website changes (steps fine, success criteria broken) cannot be repaired automatically and fail safely. Partial-DOM observability, cross-origin subresources, and DNS rebinding remain documented residual risks from the security reviews.
+
+---
+
+## Local Application (M3.1)
+
+A loopback-only local web application reusing the six M2 services directly (no CLI dependency, no new backend framework).
+
+### Setup
+
+```bash
+npm install          # installs Playwright plus React/Vite dev tooling
+npm run web:build    # builds the production React bundle into web/dist/
+```
+
+### Running
+
+```bash
+# Production: serves the built UI plus the JSON API on 127.0.0.1
+npm run serve:app
+# or: node scripts/serve-app.js [--port <n>] [--workflows-dir <path>]
+
+# Development: backend on :3939 plus Vite hot reload on :5173 (proxies /api).
+# The backend only accepts the exact development origin when it is configured explicitly:
+node scripts/serve-app.js --port 3939 --dev-origin http://127.0.0.1:5173 & npm run web:dev
+```
+
+Open `http://127.0.0.1:3939` in a browser (or `http://127.0.0.1:5173` in development). The terminal prints a one-time pairing code; enter it in the browser to pair. Sessions live in server memory and expire on restart.
+
+Environment: `SUPER_MEMORY_HOME` selects the managed home, `WORKFLOWS_DIR` overrides the workflow repository, `PORT` sets the default port.
+
+### Current scope (M3.1)
+
+Read-only foundation only: pairing/session auth, workflow listing, inspection, draft review, and integrity scanning. Execution, discovery, repair, trial, promotion, backup, and restore remain CLI-only until later M3 milestones. The serial browser-operation policy (one browser job at a time) is recorded as an architectural constraint and will be enforced before the first browser-operating API lands.
+
+### Security boundaries
+
+The server binds `127.0.0.1` exclusively, rejects unexpected `Host` headers, validates `Origin` on pairing/logout and authenticated API calls, and uses an `HttpOnly` + `SameSite=Strict` host-only session cookie (`Secure` is intentionally unset: loopback HTTP is not HTTPS, though traffic never leaves the host). A cross-process repository lock prevents the app and the CLI from operating on the same home/repository simultaneously — the second process fails fast with an actionable error. API errors are generic JSON; no stack traces, credentials, or absolute paths are served.
